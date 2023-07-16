@@ -1,0 +1,6 @@
+*.bmp
+*.fasta
+*.dna
+*.target
+*.txt
+__pycache__
