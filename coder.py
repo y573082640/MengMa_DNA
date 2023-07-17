@@ -2,7 +2,10 @@ __author__ = "Zhang, Haoling [zhanghaoling@genomics.cn]"
 
 import json
 import time
+from statistics import mode
 import numpy as np
+import copy
+import cv2
 from evaluation import DefaultCoder
 from collections import defaultdict
 from random import seed, shuffle, random, randint, choice
@@ -10,10 +13,46 @@ from numpy import array, zeros, arange, fromfile, packbits, unpackbits, expand_d
 from numpy import log2, max, sum, ceil, where, uint8, uint64
 from Chamaeleo.utils.monitor import Monitor
 from Chamaeleo.utils.pipelines import TranscodePipeline
+from Chamaeleo.utils import data_handle, indexer
+from Chamaeleo.utils.indexer import divide
+from Chamaeleo.methods.flowed import YinYangCode
+from Chamaeleo.methods.inherent import base_index, index_base
+
+
+######################################## 针对读入的操作,添加聚类
+def read_bits_from_numpy(np_array, segment_length, need_logs):
+    monitor = Monitor()
+    if need_logs:
+        print("Read binary matrix from numpy arr: " + np_array[:20])
+
+    # 将a转化为uint8类型
+    a = np_array.astype(np.uint8)
+
+    # packbits将a的每个元素转化为二进制表示并打包成uint8
+    b = np.packbits(a)
+    ori_length = len(b)
+    remainder = len(b) % segment_length
+    if remainder != 0:
+        zeros_to_add = segment_length - remainder
+        b = np.concatenate((b, np.zeros(zeros_to_add)))
+
+    b = b.tolist()
+    matrix = []
+    for index in range(0, len(b), segment_length):
+        if index + segment_length < len(b):
+            matrix.append(b[index: index + segment_length])
+        else:
+            matrix.append(b[index:] + [0] * (segment_length - len(b[index:])))
+
+        if need_logs:
+            monitor.output(max(index + segment_length, len(b)), len(b))
+
+    return matrix, ori_length
+
 
 ######################################## 针对Index的操作,添加聚类
 
-def divide_all(bit_segments, index_binary_length=None, need_logs=False):
+def get_index_of_bit_segments(bit_segments, index_binary_length=None, need_logs=False):
     """
     按照index归类序列
     """
@@ -23,34 +62,69 @@ def divide_all(bit_segments, index_binary_length=None, need_logs=False):
     if need_logs:
         print("Divide index and data from binary matrix.")
 
-    monitor = Monitor()
     indices_data_dict = {}
 
     for row in range(len(bit_segments)):
         index, data = divide(bit_segments[row], index_binary_length)
 
-        if index not in indices_data_dict:
-            indices_data_dict[index] = []
-
-        # 针对冗余情况
-        indices_data_dict[index].append(data)
-
-        if need_logs:
-            monitor.output(row + 1, len(bit_segments))
+        # 获取每段bit_segment的index
+        indices_data_dict[row] = index
 
     return indices_data_dict
 
+
+def my_divide_all(bit_segments, index_binary_length=None, need_logs=False, total_count=None):
+    if index_binary_length is None:
+        index_binary_length = int(len(str(bin(len(bit_segments)))) - 2)
+
+    if total_count is None:
+        total_count = 9999999999
+
+    if need_logs:
+        print("Divide index and data from binary matrix.")
+
+    monitor = Monitor()
+    indices = []
+    divided_matrix = []
+
+    for row in range(len(bit_segments)):
+        index, data = divide(bit_segments[row], index_binary_length)
+        if index > total_count:
+            continue
+        indices.append(index)
+        divided_matrix.append(data)
+        if need_logs:
+            monitor.output(row + 1, len(bit_segments))
+
+    return indices, divided_matrix
+
+
 ########################################
 ######################################## 自己实现的编码管道
+def get_dna_index_map(dna_bits_map, indices_of_bit_segments, total_count):
+    index_copies_map = {}
+    index_bits_map = dict.fromkeys(range(len(indices_of_bit_segments)), indices_of_bit_segments)
+
+    for dna_index, bit_indexes in dna_bits_map.items():
+        key = tuple(index_bits_map[item] for item in bit_indexes)
+        if key not in index_copies_map:
+            index_copies_map[key] = []
+        index_copies_map[key].append(dna_index)
+
+    return index_copies_map
+
+
 class MyPipeline(TranscodePipeline):
     """
     自己实现编码管道，加入DNA冗余重建的过程
     【还没实现】
     """
+
     def __init__(self, **info):
         super().__init__(**info)
 
-   def transcode(self, **info):
+
+    def transcode(self, **info):
         if "direction" in info:
             if info["direction"] == "t_c":
                 segment_length = info["segment_length"] if "segment_length" in info else 120
@@ -63,6 +137,8 @@ class MyPipeline(TranscodePipeline):
                 elif "input_string" in info:
                     bit_segments, bit_size = data_handle.read_bits_from_str(info["input_string"], segment_length,
                                                                             self.need_logs)
+                elif "input_numpy" in info:
+                    bit_segments, bit_size = read_bits_from_numpy(info["input_string"], segment_length, self.need_logs)
                 else:
                     raise ValueError("There is no digital data input here!")
 
@@ -88,7 +164,10 @@ class MyPipeline(TranscodePipeline):
                 results = self.coding_scheme.silicon_to_carbon(bit_segments, bit_size)
 
                 dna_sequences = results["dna"]
-
+                ## 冗余复制次数
+                if "dup_rate" in info and info["dup_rate"]:
+                    dna_sequences = dna_sequences * info["dup_rate"]
+                ##
                 self.records["information density"] = round(results["i"], 3)
                 self.records["encoding runtime"] = round(results["t"], 3)
 
@@ -107,9 +186,40 @@ class MyPipeline(TranscodePipeline):
                     raise ValueError("There is no digital data input here!")
 
                 original_dna_sequences = copy.deepcopy(dna_sequences)
-                
-                ## TODO：聚类纠错
-                results = self.coding_scheme.carbon_to_silicon(dna_sequences)
+
+                # 冗余重建
+                # 获取dna和bit段的对应关系
+                total_count = self.coding_scheme.total_count
+                dup_bit_segments, dna_bits_map = self.coding_scheme.decode(
+                    dna_sequences, return_map=True)  # dna_bits_map 记录DNA和bit段的对应关系,一对多或者一对一
+                # 获取纠错后的bit段
+                if self.error_correction is not None:
+                    verified_dup_bit_segments = self.error_correction.remove(dup_bit_segments)
+                    verified_dup_bit_segments = verified_dup_bit_segments['bit']
+                else:
+                    verified_dup_bit_segments = dup_bit_segments
+
+                # 获取bit段的index
+                indices_of_bit_segments, _ = indexer.divide_all(verified_dup_bit_segments,
+                                                                info["index_length"],
+                                                                self.need_logs)  # indices_of_bit_segments
+                # 记录bit段的index,一对一
+                # 根据index聚类dna
+                index_copies_map = get_dna_index_map(dna_bits_map, indices_of_bit_segments)
+                # 得到copy后重建可信dna序列
+
+                remove_dup_dna_seqs = []
+                for index, copies in index_copies_map.items():
+                    if total_count < index:
+                        continue
+                    mutated_seqs = [original_dna_sequences[i] for i in copies]
+                    # 众数为长度
+                    mode_val = mode([len(_) for _ in mutated_seqs])
+                    rebuild_result = bislide_recover(mutated_seqs, seq_len=mode_val)
+                    remove_dup_dna_seqs.append(rebuild_result)
+                # 重建结束，正式解码
+                remove_dup_dna_seqs = copy.deepcopy(remove_dup_dna_seqs)  # 防止影响到原始的original_dna_sequences
+                results = self.coding_scheme.carbon_to_silicon(remove_dup_dna_seqs)
                 self.records["decoding runtime"] = round(results["t"], 3)
 
                 bit_segments = results["bit"]
@@ -137,9 +247,11 @@ class MyPipeline(TranscodePipeline):
 
                 if "index" in info and info["index"]:
                     if "index_length" in info:
-                        indices, bit_segments = indexer.divide_all(bit_segments, info["index_length"], self.need_logs)
+                        indices, bit_segments = my_divide_all(bit_segments, info["index_length"], self.need_logs,
+                                                              total_count)
                     else:
-                        indices, bit_segments = indexer.divide_all(bit_segments, None, self.need_logs)
+                        indices, bit_segments = my_divide_all(bit_segments, None, self.need_logs,
+                                                              total_count)
 
                     bit_segments = indexer.sort_order(indices, bit_segments, self.need_logs)
 
@@ -156,6 +268,7 @@ class MyPipeline(TranscodePipeline):
         else:
             raise ValueError("Unknown parameter \"direction\", please use \"t_c\" or \"t_s\".")
 
+
 ######################################## 自己实现的YinYang Code
 class MyYinYangCode(YinYangCode):
     """
@@ -163,13 +276,16 @@ class MyYinYangCode(YinYangCode):
     原版的YinYang Code有一个BUG 就是在调用纠错码恢复之前就取出Index!!!
     【还没来得及实现】
     """
+
     def __init__(self, yang_rule=None, yin_rule=None, virtual_nucleotide="A", max_iterations=100,
-        max_ratio=0.8, faster=False, max_homopolymer=4, max_content=0.6, need_logs=False):
-
+                 max_ratio=0.8, faster=False, max_homopolymer=4, max_content=0.6, need_logs=False):
         super().__init__(yang_rule, yin_rule, virtual_nucleotide, max_iterations,
-            max_ratio, faster, max_homopolymer, max_content, need_logs)
+                         max_ratio, faster, max_homopolymer, max_content, need_logs)
 
-    def decode(self, dna_sequences):
+    def decode(self, dna_sequences, return_map=False):
+        """
+        用于将INDEX相同的DNA序列归类
+        """
         if self.index_length is None:
             raise ValueError("The parameter \"index_length\" is needed, "
                              + "which is used to eliminate additional random binary segments.")
@@ -178,7 +294,8 @@ class MyYinYangCode(YinYangCode):
                              + "which is used to eliminate additional random binary segments.")
 
         bit_segments = []
-
+        dna_bits_map = {}
+        num_of_seg = 0
         for sequence_index, dna_sequence in enumerate(dna_sequences):
             upper_bit_segment, lower_bit_segment = [], []
 
@@ -193,54 +310,58 @@ class MyYinYangCode(YinYangCode):
             bit_segments.append(upper_bit_segment)
             bit_segments.append(lower_bit_segment)
 
+            dna_bits_map[sequence_index] = (num_of_seg, num_of_seg + 1)
+            num_of_seg += 2
+
             if self.need_logs:
                 self.monitor.output(sequence_index + 1, len(dna_sequences))
 
-        remain_bit_segments = []
-        for bit_segment in bit_segments:
-            segment_index = int("".join(list(map(str, bit_segment[:self.index_length]))), 2)
-            if segment_index < self.total_count:
-                remain_bit_segments.append(bit_segment)
+        if return_map:
+            return bit_segments, dna_bits_map
+        else:
+            return bit_segments
 
-        return remain_bit_segments
 
 ######################################## 读入图像的操作
 ## author:ydh
 class ImgReader:
     def __init__(self):
         self.sample_rate = None
-    
-    def readImg(filepath:str,down_sample:bool) -> array:
+
+    def readImg(self, filepath: str, down_sample: bool) -> array:
         image = cv2.imread(filepath)
         if down_sample:
-            rows, cols, _channels = map(int, image.shape)
             # 调整图像尺寸
-            for ratio_width in [4,3,2,1]:
+            for ratio_width in [4, 3, 2, 1]:
                 if image.shape[1] % ratio_width == 0:
                     new_width = image.shape[1] // ratio_width
                     break
-            for ratio_height in [4,3,2,1]:
+            for ratio_height in [4, 3, 2, 1]:
                 if image.shape[0] % ratio_width == 0:
-                    new_height = image.shape[1] // ratio_height
+                    new_height = image.shape[0] // ratio_height
                     break
             downsampled_image = cv2.resize(image, (new_width, new_height))
-            self.sample_rate = (ratio_width,ratio_height)
+            self.sample_rate = (ratio_width, ratio_height)
+        else:
+            downsampled_image = image
         # Encode image to PNG format in memory buffer
         encoded_img = cv2.imencode('.bmp', downsampled_image)[1]
         # Convert to NumPy array
         encoded_img_np = np.array(encoded_img)
         return encoded_img_np
 
-    def toImg(img_array:array,blur:bool):
+    def toImg(self, img_array: array, blur: bool):
         # 解码
         decoded_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+        rows, cols, _channels = map(int, decoded_img.shape)
         # 去噪
         if blur:
             decoded_img = cv2.medianBlur(decoded_img, 3)
         # 还原
         if self.sample_rate is not None:
-            decoded_img = cv2.resize(decoded_img, (new_width*self.sample_rate[0], new_height**self.sample_rate[1]))
+            decoded_img = cv2.resize(decoded_img, (cols * self.sample_rate[0], rows * self.sample_rate[1]))
         return decoded_img
+
 
 ######################################## 从错误中恢复的代码
 ## author:xyc
@@ -255,7 +376,7 @@ def recover_seq(mutated_seqs, cur_rec_seq=''):
     min_len = min(map(len, mutated_seqs))
     if min_len < 4 or len(most_common_pattern) < 3:
         return cur_rec_seq + most_common_pattern
-    
+
     common_patterns = [p for p in patterns.keys() if patterns[p] == max_count]
     # 多条序列突变结果一致
     if len(common_patterns) > 1:
@@ -313,7 +434,8 @@ def bislide_recover(mutated_seqs, seq_len):
 
     # 正反两条恢复链长度小于原序列，中间插入随机碱基（保证首尾正确性）
     if len(forward_rec) + len(inverse_rec) < seq_len:
-        rec_seq = forward_rec + ''.join([choice(["A", "C", "G", "T"]) for _ in range(seq_len - len(forward_rec) - len(inverse_rec))]) + inverse_rec
+        rec_seq = forward_rec + ''.join(
+            [choice(["A", "C", "G", "T"]) for _ in range(seq_len - len(forward_rec) - len(inverse_rec))]) + inverse_rec
     else:
         rec_seq = forward_rec + inverse_rec
     return rec_seq
@@ -325,7 +447,8 @@ def cal_acc(ori_seq, rec_seq):
     author: xyc
     """
     assert len(ori_seq) == len(rec_seq)
-    return len([ii for ii in range(len(ori_seq)) if ori_seq[ii]==rec_seq[ii]]) / len(ori_seq)
+    return len([ii for ii in range(len(ori_seq)) if ori_seq[ii] == rec_seq[ii]]) / len(ori_seq)
+
 
 ######################################## 需要我们自己实现的Coder
 
@@ -481,4 +604,3 @@ class Coder(DefaultCoder):
             print("Save bits to the file.")
         byte_array = packbits(bits.reshape(len(bits) // 8, 8), axis=1).reshape(-1)
         byte_array.tofile(file=output_image_path)
-
