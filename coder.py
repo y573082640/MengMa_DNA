@@ -2,40 +2,37 @@ __author__ = "Zhang, Haoling [zhanghaoling@genomics.cn]"
 
 import json
 import time
+from datetime import datetime
 from statistics import mode
 import numpy as np
 import copy
 import cv2
+from Chamaeleo.utils.data_handle import save_model, load_model
+
 from evaluation import DefaultCoder
 from collections import defaultdict
 from random import seed, shuffle, random, randint, choice
 from numpy import array, zeros, arange, fromfile, packbits, unpackbits, expand_dims, concatenate, add
-from numpy import log2, max, sum, ceil, where, uint8, uint64
+from numpy import log2, sum, ceil, where, uint8, uint64
 from Chamaeleo.utils.monitor import Monitor
 from Chamaeleo.utils.pipelines import TranscodePipeline
 from Chamaeleo.utils import data_handle, indexer
 from Chamaeleo.utils.indexer import divide
 from Chamaeleo.methods.flowed import YinYangCode
 from Chamaeleo.methods.inherent import base_index, index_base
+from Chamaeleo.methods.ecc import ReedSolomon, Hamming
 
 
 ######################################## 针对读入的操作,添加聚类
 def read_bits_from_numpy(np_array, segment_length, need_logs):
-    monitor = Monitor()
     if need_logs:
-        print("Read binary matrix from numpy arr: " + np_array[:20])
+        print("Read binary matrix from numpy arr: ")
 
     # 将a转化为uint8类型
     a = np_array.astype(np.uint8)
-
     # packbits将a的每个元素转化为二进制表示并打包成uint8
-    b = np.packbits(a)
+    b = np.unpackbits(a)
     ori_length = len(b)
-    remainder = len(b) % segment_length
-    if remainder != 0:
-        zeros_to_add = segment_length - remainder
-        b = np.concatenate((b, np.zeros(zeros_to_add)))
-
     b = b.tolist()
     matrix = []
     for index in range(0, len(b), segment_length):
@@ -43,9 +40,6 @@ def read_bits_from_numpy(np_array, segment_length, need_logs):
             matrix.append(b[index: index + segment_length])
         else:
             matrix.append(b[index:] + [0] * (segment_length - len(b[index:])))
-
-        if need_logs:
-            monitor.output(max(index + segment_length, len(b)), len(b))
 
     return matrix, ori_length
 
@@ -101,28 +95,57 @@ def my_divide_all(bit_segments, index_binary_length=None, need_logs=False, total
 
 ########################################
 ######################################## 自己实现的编码管道
-def get_dna_index_map(dna_bits_map, indices_of_bit_segments, total_count):
+def list_to_indexed_dict(lst):
+    indexed_dict = {}
+    for index, value in enumerate(lst):
+        indexed_dict[index] = value
+    return indexed_dict
+
+def are_all_elements_same(tuple_obj):
+    # Check if all elements in the tuple are the same
+    return all(element == tuple_obj[0] for element in tuple_obj)
+
+def get_dna_index_map(dna_bits_map, indices_of_bit_segments, max_bit_index):
+    """
+    根据两条index来给DNA分组
+    :param dna_bits_map dict，key为dna序列的下标，value为Tuple(i,j)即解码出两条bits的下标i,j
+    :param indices_of_bit_segments list，下标为i的bit_segment对应的index
+    :param max_bit_index 解码出的index不应该超过这个范围，否则无效
+    """
     index_copies_map = {}
-    index_bits_map = dict.fromkeys(range(len(indices_of_bit_segments)), indices_of_bit_segments)
+    index_bits_map = list_to_indexed_dict(indices_of_bit_segments)
 
     for dna_index, bit_indexes in dna_bits_map.items():
-        key = tuple(index_bits_map[item] for item in bit_indexes)
-        if key not in index_copies_map:
-            index_copies_map[key] = []
-        index_copies_map[key].append(dna_index)
+        key = tuple(sorted([index_bits_map[item] for item in bit_indexes]))
+        index_copies_map[dna_index] = key
 
-    return index_copies_map
+    ret = {}
+    bad_result = []
+    all_num = {}
+
+    for k, v in index_copies_map.items():
+        if min(v) > max_bit_index or are_all_elements_same(v) or min(v) < 0:
+            bad_result.append(v)
+            continue
+        if v not in ret:
+            ret[v] = []
+        ret[v].append(k)
+        all_num[v[0]] = 1
+        all_num[v[1]] = 1
+
+    print(ret.keys())
+    print(len(bad_result))
+    print(len(all_num.keys()))
+    return ret
 
 
 class MyPipeline(TranscodePipeline):
     """
     自己实现编码管道，加入DNA冗余重建的过程
-    【还没实现】
     """
 
     def __init__(self, **info):
         super().__init__(**info)
-
 
     def transcode(self, **info):
         if "direction" in info:
@@ -138,7 +161,7 @@ class MyPipeline(TranscodePipeline):
                     bit_segments, bit_size = data_handle.read_bits_from_str(info["input_string"], segment_length,
                                                                             self.need_logs)
                 elif "input_numpy" in info:
-                    bit_segments, bit_size = read_bits_from_numpy(info["input_string"], segment_length, self.need_logs)
+                    bit_segments, bit_size = read_bits_from_numpy(info["input_numpy"], segment_length, self.need_logs)
                 else:
                     raise ValueError("There is no digital data input here!")
 
@@ -165,8 +188,10 @@ class MyPipeline(TranscodePipeline):
 
                 dna_sequences = results["dna"]
                 ## 冗余复制次数
+                print('dna seq nums:', len(dna_sequences))
                 if "dup_rate" in info and info["dup_rate"]:
                     dna_sequences = dna_sequences * info["dup_rate"]
+                    print('dna seq nums after replicate:', len(dna_sequences))
                 ##
                 self.records["information density"] = round(results["i"], 3)
                 self.records["encoding runtime"] = round(results["t"], 3)
@@ -185,39 +210,49 @@ class MyPipeline(TranscodePipeline):
                 else:
                     raise ValueError("There is no digital data input here!")
 
+                ##  进入这个函数之前要变成list
+                dna_sequences = [list(i) for i in dna_sequences]
                 original_dna_sequences = copy.deepcopy(dna_sequences)
 
                 # 冗余重建
                 # 获取dna和bit段的对应关系
-                total_count = self.coding_scheme.total_count
-                dup_bit_segments, dna_bits_map = self.coding_scheme.decode(
-                    dna_sequences, return_map=True)  # dna_bits_map 记录DNA和bit段的对应关系,一对多或者一对一
+                max_bit_index = self.coding_scheme.dna_count * 2 ## 此处是针对阴阳码的 hard code
+
+                result = self.coding_scheme.carbon_to_silicon(dna_sequences)  # dna_bits_map 记录DNA和bit段的对应关系,一对多或者一对一
+                dup_bit_segments = result['bit']
+                dna_bits_map = result['map']
+                print(len(dna_sequences), len(dup_bit_segments), len(dna_bits_map))
+
                 # 获取纠错后的bit段
                 if self.error_correction is not None:
-                    verified_dup_bit_segments = self.error_correction.remove(dup_bit_segments)
-                    verified_dup_bit_segments = verified_dup_bit_segments['bit']
+                    remove_result = self.error_correction.remove(dup_bit_segments)
+                    verified_dup_bit_segments = remove_result['bit']
+                    print(remove_result['e_r'], len(remove_result['e_bit']))
                 else:
                     verified_dup_bit_segments = dup_bit_segments
-
+                print(len(verified_dup_bit_segments))
                 # 获取bit段的index
                 indices_of_bit_segments, _ = indexer.divide_all(verified_dup_bit_segments,
                                                                 info["index_length"],
                                                                 self.need_logs)  # indices_of_bit_segments
+                print('indices_of_bit_segments len and max : ', len(indices_of_bit_segments),
+                      max(indices_of_bit_segments))
+                print('total count of bit seqs: ', max_bit_index)
                 # 记录bit段的index,一对一
-                # 根据index聚类dna
-                index_copies_map = get_dna_index_map(dna_bits_map, indices_of_bit_segments)
+                # 根据index聚类dna,index突变的就不要了
+                index_copies_map = get_dna_index_map(dna_bits_map, indices_of_bit_segments, max_bit_index)
                 # 得到copy后重建可信dna序列
-
                 remove_dup_dna_seqs = []
+                print('dna seq nums before rebuild:', len(original_dna_sequences))
+                print('dna seq nums rebuild groups:', len(index_copies_map.values()))
                 for index, copies in index_copies_map.items():
-                    if total_count < index:
-                        continue
-                    mutated_seqs = [original_dna_sequences[i] for i in copies]
+                    mutated_seqs = ["".join(original_dna_sequences[i]) for i in copies]
                     # 众数为长度
                     mode_val = mode([len(_) for _ in mutated_seqs])
                     rebuild_result = bislide_recover(mutated_seqs, seq_len=mode_val)
-                    remove_dup_dna_seqs.append(rebuild_result)
+                    remove_dup_dna_seqs.append(list(rebuild_result))
                 # 重建结束，正式解码
+                print('dna seq nums after rebuild:', len(remove_dup_dna_seqs))
                 remove_dup_dna_seqs = copy.deepcopy(remove_dup_dna_seqs)  # 防止影响到原始的original_dna_sequences
                 results = self.coding_scheme.carbon_to_silicon(remove_dup_dna_seqs)
                 self.records["decoding runtime"] = round(results["t"], 3)
@@ -245,6 +280,7 @@ class MyPipeline(TranscodePipeline):
                 if not bit_segments:
                     return {"bit": None, "dna": original_dna_sequences}
 
+                total_count = self.coding_scheme.total_count
                 if "index" in info and info["index"]:
                     if "index_length" in info:
                         indices, bit_segments = my_divide_all(bit_segments, info["index_length"], self.need_logs,
@@ -274,15 +310,87 @@ class MyYinYangCode(YinYangCode):
     """
     自己实现阴阳编码的解码过程,目的是将DNA序列根据index聚类归类
     原版的YinYang Code有一个BUG 就是在调用纠错码恢复之前就取出Index!!!
-    【还没来得及实现】
     """
 
     def __init__(self, yang_rule=None, yin_rule=None, virtual_nucleotide="A", max_iterations=100,
                  max_ratio=0.8, faster=False, max_homopolymer=4, max_content=0.6, need_logs=False):
         super().__init__(yang_rule, yin_rule, virtual_nucleotide, max_iterations,
                          max_ratio, faster, max_homopolymer, max_content, need_logs)
+        self.dna_count = None
 
-    def decode(self, dna_sequences, return_map=False):
+    def silicon_to_carbon(self, bit_segments, bit_size):
+        for bit_segment in bit_segments:
+            if type(bit_segment) != list or type(bit_segment[0]) != int:
+                raise ValueError("The dimension of bit matrix can only be 2!")
+
+        self.bit_size = bit_size
+        self.segment_length = len(bit_segments[0])
+        start_time = datetime.now()
+
+        if self.need_logs:
+            print("The bit size of the encoded file is " + str(self.bit_size) + " bits and"
+                  + " the length of final encoded binary segments is " + str(self.segment_length))
+
+        if self.need_logs:
+            print("Encode bit segments to DNA sequences by coding scheme.")
+
+        dna_sequences = self.encode(bit_segments)
+
+        encoding_runtime = (datetime.now() - start_time).total_seconds()
+
+        nucleotide_count = 0
+        for dna_sequence in dna_sequences:
+            nucleotide_count += len(dna_sequence)
+
+        information_density = bit_size / nucleotide_count
+
+        return {"dna": dna_sequences, "i": information_density, "t": encoding_runtime}
+
+    def carbon_to_silicon(self, dna_sequences):
+        if self.bit_size is None:
+            raise ValueError("The parameter \"bit_size\" is needed, "
+                             + "which guides the number of bits reserved at the end of the digital file!")
+        if self.segment_length is None:
+            raise ValueError("The parameter \"segment_length\" is needed, "
+                             + "which clears the information that may exist in each sequence. "
+                             + "For example, assuming that the coding scheme requires an even binary segment length, "
+                             + "if the inputted length is an odd number, a bit [0] is added at the end.")
+
+        for dna_sequence in dna_sequences:
+            if type(dna_sequence) != list or type(dna_sequence[0]) != str:
+                raise ValueError("The dimension of nucleotide matrix can only be 2!")
+
+        start_time = datetime.now()
+
+        if self.need_logs:
+            print("Decode DNA sequences to bit segments by coding scheme.")
+        bit_segments, dna_bits_map = self.decode(dna_sequences)
+
+        for segment_index, bit_segment in enumerate(bit_segments):
+            if len(bit_segment) != self.segment_length:
+                bit_segments[segment_index] = bit_segment[: self.segment_length]
+
+        decoding_runtime = (datetime.now() - start_time).total_seconds()
+
+        return {"bit": bit_segments, "s": self.bit_size, "t": decoding_runtime, 'map': dna_bits_map}
+
+    def encode(self, bit_segments):
+        self.index_length = int(len(str(bin(len(bit_segments)))) - 2)
+        self.total_count = len(bit_segments)
+
+        if self.faster:
+            dna_sequences = self.faster_encode(bit_segments)
+        else:
+            dna_sequences = self.normal_encode(bit_segments)
+
+        if self.need_logs:
+            print("There are " + str(len(dna_sequences) * 2 - self.total_count)
+                  + " random bit segment(s) adding for logical reliability.")
+
+        self.dna_count = len(dna_sequences)
+        return dna_sequences
+
+    def decode(self, dna_sequences):
         """
         用于将INDEX相同的DNA序列归类
         """
@@ -316,10 +424,16 @@ class MyYinYangCode(YinYangCode):
             if self.need_logs:
                 self.monitor.output(sequence_index + 1, len(dna_sequences))
 
-        if return_map:
-            return bit_segments, dna_bits_map
-        else:
-            return bit_segments
+        # if remove_random_bit_seq:
+        #     remain_bit_segments = []
+        #     for bit_segment in bit_segments:
+        #         segment_index = int("".join(list(map(str, bit_segment[:self.index_length]))), 2)
+        #         if segment_index < self.total_count:
+        #             remain_bit_segments.append(bit_segment)
+        #
+        #     return remain_bit_segments, dna_bits_map
+        # else:
+        return bit_segments, dna_bits_map
 
 
 ######################################## 读入图像的操作
@@ -474,7 +588,8 @@ class Coder(DefaultCoder):
 
         """
         super().__init__(team_id=team_id)
-        self.address, self.payload = 12, 128
+        self.address, self.payload = 16, 144
+        self.check_size = 8
         self.supplement, self.message_number = 0, 0
 
     def image_to_dna(self, input_image_path, need_logs=True):
@@ -495,53 +610,28 @@ class Coder(DefaultCoder):
             Because the DNA sequence list obtained in DNA sequencing is inconsistent with the existing list.
         """
         if need_logs:
-            print("Obtain binaries from file.")
-        bits = unpackbits(expand_dims(fromfile(file=input_image_path, dtype=uint8), 1), axis=1).reshape(-1)
+            print("init models ...")
+        reader = ImgReader()
+        coding_scheme = MyYinYangCode(faster=True)
+        pipeline = MyPipeline(coding_scheme=coding_scheme,
+                              error_correction=None,
+                              need_logs=True)
         if need_logs:
-            print("%d bits are obtained." % len(bits))
-
-        if len(bits) % (self.payload * 2) != 0:
-            self.supplement = self.payload * 2 - len(bits) % (self.payload * 2)
-            if need_logs:
-                print("Supplement %d bits to make sure all payload lengths are same." % self.supplement)
-            bits = concatenate((bits, zeros(shape=(self.supplement,), dtype=uint8)), axis=0)
-        binary_messages = bits.reshape(len(bits) // (128 * 2), (128 * 2))
-        self.message_number = len(binary_messages)
-
+            print("read img ...")
+        img_array = reader.readImg(input_image_path, True)
         if need_logs:
-            print("Insert index for each binary message.")
-        byte_number = ceil(log2(len(binary_messages)) / log2(256)).astype(int)
-        mould = zeros(shape=(len(binary_messages), byte_number), dtype=uint8)
-        integers = arange(len(binary_messages), dtype=int)
-        for index in range(byte_number):
-            mould[:, -1 - index] = integers % 256
-            integers //= 256
-        index_matrix = unpackbits(expand_dims(mould.reshape(-1), axis=1), axis=1)
-        index_matrix = index_matrix.reshape(len(binary_messages), byte_number * 8)
-        unused_locations = where(sum(index_matrix, axis=0) == 0)[0]
-        start_location = max(unused_locations) + 1 if len(unused_locations) > 0 else 0
-        index_matrix = index_matrix[:, start_location:]
-        if self.address * 2 > len(index_matrix[0]):  # use the given address length.
-            expanded_matrix = zeros(shape=(len(binary_messages), self.address * 2 - len(index_matrix[0])), dtype=uint8)
-            index_matrix = concatenate((expanded_matrix, index_matrix), axis=1)
-        elif self.address * 2 < len(index_matrix[0]):
-            raise ValueError("The address length is too short to represent all addresses.")
-        binary_messages = concatenate((index_matrix, binary_messages), axis=1)
-
+            print("transcode bits ...")
+        results = pipeline.transcode(direction="t_c",
+                                     input_numpy=img_array,
+                                     dup_rate=15,
+                                     output_path='target.dna',
+                                     segment_length=self.payload,
+                                     index_length=self.address, index=True)
         if need_logs:
-            print("Encode binary messages based on the mapping scheme.")
-        digit_set = 2 * binary_messages[:, :self.address + self.payload]
-        digit_set += binary_messages[:, self.address + self.payload:]
-        digit_set[digit_set == 0] = ord("A")
-        digit_set[digit_set == 1] = ord("C")
-        digit_set[digit_set == 2] = ord("G")
-        digit_set[digit_set == 3] = ord("T")
-        dna_sequences = []
-        for digits in digit_set:
-            dna_sequences.append(digits.tostring().decode("ascii"))
-            if need_logs:
-                self.monitor(len(dna_sequences), len(binary_messages))
-
+            print("save model ...")
+        save_model(path='code_schema.pkl', model=coding_scheme, need_logs=True)
+        save_model(path='img_reader.pkl', model=reader, need_logs=True)
+        dna_sequences = ["".join(_) for _ in results['dna']]
         return dna_sequences
 
     def dna_to_image(self, dna_sequences, output_image_path, need_logs=True):
@@ -563,44 +653,20 @@ class Coder(DefaultCoder):
         """
         if need_logs:
             print("Decode DNA sequences based on the mapping scheme.")
-        binary_messages = zeros(shape=(self.message_number, 2 * (self.address + self.payload)), dtype=uint8)
-        mapping = {"A": [0, 0], "C": [0, 1], "G": [1, 0], "T": [1, 1]}
-        for index, dna_sequence in enumerate(dna_sequences):
-            for nucleotide_index, nucleotide in enumerate(dna_sequence[:self.address + self.payload]):
-                upper, lower = mapping[nucleotide]
-                binary_messages[index, nucleotide_index] = upper
-                binary_messages[index, nucleotide_index + self.address + self.payload] = lower
-            if need_logs:
-                self.monitor(index + 1, len(dna_sequences))
-        binary_messages = array(binary_messages, dtype=uint8)
+        reader = load_model(path='img_reader.pkl', need_logs=True)
+        coding_scheme = load_model(path='code_schema.pkl', need_logs=True)
+        pipeline = MyPipeline(coding_scheme=coding_scheme,
+                              error_correction=None,
+                              need_logs=True)
+        result = pipeline.transcode(direction="t_s",
+                                    segment_length=self.payload,
+                                    index_length=self.address,
+                                    dup_rate=9,
+                                    input_string=dna_sequences,
+                                    index=True)
 
-        if need_logs:
-            print("Sort binary messages and convert them as bits.")
-        index_matrix, binary_messages = binary_messages[:, :self.address * 2], binary_messages[:, self.address * 2:]
-        message_number, byte_number = len(index_matrix), ceil(len(index_matrix[0]) / 8).astype(int)
-        if len(index_matrix[0]) % 8 != 0:
-            expanded_matrix = zeros(shape=(message_number, 8 * byte_number - len(index_matrix[0])), dtype=uint8)
-            template = concatenate((expanded_matrix, index_matrix), axis=1)
-        else:
-            template = index_matrix
-        mould = packbits(template.reshape(message_number * byte_number, 8), axis=1).reshape(message_number, byte_number)
-        orders = zeros(shape=(message_number,), dtype=uint64)
-        for index in range(byte_number):
-            orders = add(orders, mould[:, -1 - index] * (256 ** index), out=orders,
-                         casting="unsafe")  # make up according to the byte scale.
-        sorted_binary_messages = zeros(shape=(self.message_number, 2 * self.payload), dtype=uint8)
-        for index, order in enumerate(orders):
-            if order < len(sorted_binary_messages):
-                sorted_binary_messages[order] = binary_messages[index]
-            if need_logs:
-                self.monitor(index + 1, len(orders))
-
-        bits = sorted_binary_messages.reshape(-1)
-        bits = bits[:-self.supplement]
-        if need_logs:
-            print("%d bits are retrieved." % len(bits))
-
-        if need_logs:
-            print("Save bits to the file.")
-        byte_array = packbits(bits.reshape(len(bits) // 8, 8), axis=1).reshape(-1)
-        byte_array.tofile(file=output_image_path)
+        img_np = result['bit'][:coding_scheme.bit_size]
+        img_np = np.array(img_np)
+        img_np = np.packbits(img_np)
+        img = reader.toImg(img_np, blur=False)
+        cv2.imwrite(output_image_path, img)
