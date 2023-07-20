@@ -186,12 +186,15 @@ class MyPipeline(TranscodePipeline):
 
                 results = self.coding_scheme.silicon_to_carbon(bit_segments, bit_size)
 
-                dna_sequences = results["dna"]
+                dna_sequences = []
                 ## 冗余复制次数
                 print('dna seq nums:', len(dna_sequences))
                 if "dup_rate" in info and info["dup_rate"]:
-                    dna_sequences = dna_sequences * info["dup_rate"]
-                    print('dna seq nums after replicate:', len(dna_sequences))
+                    for s in results["dna"]:
+                        dna_sequences += [s] * info["dup_rate"]
+                else:
+                    dna_sequences = results["dna"]
+                print('dna seq nums after replicate:', len(dna_sequences))
                 ##
                 self.records["information density"] = round(results["i"], 3)
                 self.records["encoding runtime"] = round(results["t"], 3)
@@ -588,8 +591,8 @@ class Coder(DefaultCoder):
 
         """
         super().__init__(team_id=team_id)
-        self.address, self.payload = 16, 144
-        self.check_size = 8
+        self.address, self.payload = 18, 184 - 18
+        self.check_size = 4
         self.supplement, self.message_number = 0, 0
 
     def image_to_dna(self, input_image_path, need_logs=True):
@@ -614,7 +617,7 @@ class Coder(DefaultCoder):
         reader = ImgReader()
         coding_scheme = MyYinYangCode(faster=False)
         pipeline = MyPipeline(coding_scheme=coding_scheme,
-                              error_correction=None,
+                              error_correction=Hamming(),
                               need_logs=True)
         if need_logs:
             print("read img ...")

@@ -1,6 +1,6 @@
 from itertools import product
 import json
-from sklearn.cluster import KMeans, MiniBatchKMeans, AgglomerativeClustering, MeanShift, OPTICS
+from sklearn.cluster import KMeans, MiniBatchKMeans, AgglomerativeClustering, MeanShift, OPTICS, HDBSCAN
 from sklearn.cluster import BisectingKMeans
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA
@@ -19,6 +19,7 @@ from numpy import ceil
 import multiprocessing as mp
 from sklearn.neighbors import NearestNeighbors
 
+kmers_2 = [''.join(p) for p in product('ACGT', repeat=2)]
 kmers_3 = ["".join(p) for p in product("ACGT", repeat=3)]
 kmers_4 = ["".join(p) for p in product("ACGT", repeat=4)]
 
@@ -54,6 +55,7 @@ def get_sequences_from_fasta(file_path, copy_num):
 def get_subseq_features(dna_seq, sub_len):
     seq_len = len(dna_seq)
     subseq_len = seq_len // sub_len
+    assert seq_len % sub_len != 0
     features = []
     for i in range(sub_len):
         subseq = dna_seq[i * subseq_len: (i + 1) * subseq_len]
@@ -63,15 +65,25 @@ def get_subseq_features(dna_seq, sub_len):
 
 
 # 构建所有可能的k-mer子序列
-def get_kmer_features(dna_seq, kmer_len=3):
-    kmer_counts = dict()
-    if kmer_len == 3:
-        for kmer in kmers_3:
-            kmer_counts[kmer] = dna_seq.count(kmer)
-    elif kmer_len == 4:
-        for kmer in kmers_4:
-            kmer_counts[kmer] = dna_seq.count(kmer)
-    kmer_features = list(kmer_counts.values())
+def get_kmer_features(dna_seq, kmer_len=2):
+    # 将DNA序列分成4段
+    seq_len = len(dna_seq)
+    segment_len = 48
+    seq_segments = [dna_seq[i:i+segment_len] for i in range(0, segment_len * 4, segment_len)]
+
+    kmer_features = []
+    for segment in seq_segments:
+        kmer_counts = dict()
+        if kmer_len == 3:
+            for kmer in kmers_3:
+                kmer_counts[kmer] = segment.count(kmer)
+        elif kmer_len == 2:
+            for kmer in kmers_2:
+                kmer_counts[kmer] = segment.count(kmer)
+        elif kmer_len == 4:
+            for kmer in kmers_4:
+                kmer_counts[kmer] = segment.count(kmer)
+        kmer_features.extend(list(kmer_counts.values()))
     return kmer_features
 
 
@@ -86,6 +98,9 @@ def get_features(seqs, n_components, sub_len, kmer_len):
         pca = PCA(n_components=n_components)
         pca.fit(seq_fearures)
         seq_fearures = pca.transform(seq_fearures)
+        print('所保留的n个成分各自的方差百分比:', pca.explained_variance_ratio_)
+        print('所保留的n个成分各自的方差值:', pca.explained_variance_)
+        print(seq_fearures.shape)
     return seq_fearures
 
 
@@ -141,94 +156,107 @@ def level3_pass(seq_features, index_of_seqs, n_cluster):
     return divide_index_into_clusters(model.labels_, index_of_seqs)
 
 
-def cluster(dna_seqs, n_cluster, copy_num, avg_dist=6.4, pca_component=None):
+def cluster_pipeline(dna_seqs, n_cluster, copy_num, pca_component=None, rough_threshold=3000):
+    print('get dna seqs features ... ')
+    seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
+    min_eps, max_eps = 3, 8
+    eps = min_eps
+    pipeline = queue.Queue()
+    pipeline.put((n_cluster, range(len(dna_seqs))))
+    results = []
+    print('start queue clustering  ... ')
+    epoch = 0
+    while pipeline.empty() is False:
+        print('epoch:', epoch)
+        epoch += 1
+        if eps >= max_eps:
+            exit(-2)
+        tmp_num_cluster, remained_indices = pipeline.get()
+        print('eps:{},remain number:{},cluster number:{}'.format(eps, len(remained_indices), tmp_num_cluster))
+        remain_results, rets = cluster(seq_features, remained_indices, copy_num, eps, rough_threshold)
+        results += rets
+        if len(remain_results) > rough_threshold:
+            assert len(remain_results) % copy_num == 0
+            tmp_num_cluster = ceil(len(remain_results) / copy_num)
+            pipeline.put((tmp_num_cluster, remain_results))
+        else:
+            _, final_result = level3_pass(seq_features[remain_results], remain_results, n_cluster - len(results))
+            results += final_result
+            break
+        eps = eps + 0.25
+    length_of_result = list(map(len, results))
+    print("clustering results is {}/{}, length of group between {} to {}".format(
+        len(results),
+        n_cluster,
+        min(length_of_result),
+        max(length_of_result))
+    )
+
+
+def cluster(seq_features, indices, copy_num, avg_dist=6.4, rough_threshold=3000):
     """
     使用队列完成不同层次的聚类聚类法
     6.4为大多数cluster内平均最大距离,因此eps设置在[5.7,6.2]之间
     40w条数据 210秒
-    :param dna_seqs: 输入的dna string数组
-    :param n_cluster 聚类数量
+    :param seq_features: 输入的dna 特征
+    :param rough_threshold 区分采用哪种聚类方法的阈值
     :param copy_num : 复制比例
     :param avg_dist 用于确定eps
-    :param pca_component PCA降维法的参数，设置为None则不降维
+    :param indices dna特征中的未分类下标
     """
 
     result = []
     abnormal_result = []
-    rough_threshold = 3000
-    print('get dna seqs features ... ')
-    seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=10)
     cluster_queue = queue.Queue()
     rough_time, refine_time = 0, 0
     total_refine_sample = 0
-    cluster_queue.put((avg_dist + 0.2, range(len(dna_seqs))))
-    print('start queue clustering  ... ')
+    cluster_queue.put((-1, indices))
     round_count = 0
     while cluster_queue.empty() is False:
-        # print('round {} ... '.format(round_count))
         round_count += 1
         last_iter_eps, copy_group = cluster_queue.get()
-        this_iter_eps = last_iter_eps - 0.2
+        this_iter_eps = last_iter_eps + 1
         num_of_cluster = int(ceil(len(copy_group) / copy_num))
         if len(copy_group) == copy_num:
             result.append(copy_group)
         elif len(copy_group) < copy_num:
             abnormal_result += copy_group
         else:
-            if len(copy_group) > rough_threshold and this_iter_eps>4.0:
-                # print('level2_pass... {} {}'.format(len(copy_group), this_iter_eps))
+            if len(copy_group) > rough_threshold and this_iter_eps <= 1:
                 ## 二级聚类
                 start = time.time()
                 abnormal_ones, label_of_indices = level2_pass(seq_features[copy_group],
                                                               index_of_seqs=copy_group,
-                                                              min_samples=copy_num//2,
-                                                              eps=this_iter_eps)
+                                                              min_samples=copy_num // 2,
+                                                              eps=avg_dist)
                 end = time.time()
                 rough_time += end - start
-            else:
+            elif len(copy_group) <= rough_threshold:
                 ## 三级聚类
-                # print('level3_pass... {} {}'.format(len(copy_group), num_of_cluster))
                 total_refine_sample += len(copy_group)
                 start = time.time()
                 abnormal_ones, label_of_indices = level3_pass(seq_features[copy_group], copy_group, num_of_cluster)
                 end = time.time()
                 refine_time += end - start
+            else:
+                abnormal_ones = copy_group
+                label_of_indices = []
             for k in label_of_indices:
-                cluster_queue.put((this_iter_eps, k))
+                cluster_queue.put((this_iter_eps + 1, k))
             abnormal_result += abnormal_ones
 
-    abnormal_time = 0
-    if n_cluster > len(result):
-        pass
-        # start = time.time()
-        # _, final_result = level3_pass(seq_features[abnormal_result], abnormal_result, n_cluster - len(result))
-        # result += final_result
-        # end = time.time()
-        # abnormal_time += end - start
-
-    length_of_result = list(map(len, result))
-    print("clustering results is {}/{}, length of group between {} to {}".format(
-        len(result),
-        n_cluster,
-        min(length_of_result),
-        max(length_of_result))
-    )
-    print('rough cost is {}s, refine cost is {}s, abnormal cost is {}s'.format(round(rough_time, 3),
-                                                                               round(refine_time, 3),
-                                                                               round(abnormal_time, 3)))
-    print('refine sample number is {},abnormal sample number is {} '.format(total_refine_sample, len(abnormal_result)))
-    ret = []
-    for group in result:
-        ret.append([dna_seqs[i] for i in group])
-    return ret
+    print('rough cost is {}s, refine cost is {}s'.format(round(rough_time, 3), round(refine_time, 3)))
+    print('refine sample number is {},abnormal sample number is {} '.format(total_refine_sample,
+                                                                            len(abnormal_result)))
+    return abnormal_result, result
 
 
 def test_max_eps(filepath, iter_time, pca_component, copy_num):
     n_clusters, dna_seqs = get_sequences_from_fasta(filepath, copy_num=copy_num)
     t1_avg_dist, t2_avg_max_inner_dist, max_inner_dist = [], [], 0
     shuffle(dna_seqs)
-    seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=10)
-    k_distance(seq_features, copy_num+1)
+    seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
+    k_distance(seq_features, copy_num + 1)
     # index_list = range(len(seq_features))
     # for i in range(iter_time):
     #     chosen_list = np.random.choice(index_list, n_clusters * 3, False)
@@ -256,13 +284,46 @@ def k_distance(features, k):
     max_dist = np.squeeze(distances[:, -1])
     ## 90中位数
     a_sorted = np.sort(max_dist)
-    percentile_index = int(0.90 * len(a_sorted))
-    percentile = a_sorted[percentile_index]
+    percentile_90 = int(0.99 * len(a_sorted))
+    percentile_10 = int(0.01 * len(a_sorted))
+    percentile_90 = a_sorted[percentile_90]
+    percentile_10 = a_sorted[percentile_10]
     avg = np.average(a_sorted)
     mid = np.median(a_sorted)
     ## 输出
-    print(mid, percentile, avg)
-    return distances, indices
+    print(mid, percentile_90, percentile_10, avg)
+    return mid, percentile_90, percentile_10, avg
+
+
+def test_hdbscan(dna_seqs, copy_num, pca_component=None):
+    print('get dna seqs features ... ')
+    seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
+    model = HDBSCAN(min_cluster_size=copy_num,
+                    min_samples=copy_num // 2,
+                    cluster_selection_method='eom').fit(seq_features)
+    labels = model.labels_
+    result_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+    result_noise_ = list(labels).count(-1)
+    print("Estimated number of clusters: %d" % result_clusters_)
+    print("Estimated number of noise points: %d" % result_noise_)
+    print('-' * 20)
+
+
+def test_kmeans(dna_seqs, n_cluster, pca_component=None):
+    print('get dna seqs features ... ')
+    seq_features = get_features(dna_seqs, pca_component, kmer_len=2, sub_len=15)
+    model = BisectingKMeans(n_clusters=n_cluster, n_init=5, init='k-means++', bisecting_strategy='largest_cluster').fit(
+        seq_features)
+
+    labels = model.labels_
+    label_dict = defaultdict(list)
+    for idx, label in enumerate(labels):
+        label_dict[label].append(dna_seqs[idx])
+    for k, v in label_dict.items():
+        if 13 >= len(v) >= 12:
+            print(v)
+    unique, counts = np.unique(labels, return_counts=True)
+    print(dict(zip(unique, counts)))
 
 
 if __name__ == "__main__":
@@ -276,7 +337,8 @@ if __name__ == "__main__":
     # print(avg_dist, avg_max_inner_dist)
     # n_cluster, dna_seqs = get_sequences('test_data/dna_seq_rebuild_train.json', cut=-1)
     n_cluster, dna_seqs = get_sequences_from_fasta(pasta_file, copy_num=copy_num)
-    cluster_result = cluster(dna_seqs, n_cluster, pca_component=None, avg_dist=6.34, copy_num=copy_num)
+    test_kmeans(dna_seqs, n_cluster, 'mle')
+    # cluster_pipeline(dna_seqs, n_cluster, copy_num=copy_num, pca_component=None)
     # end = time.time()
     # print('运行时间:', end - start)
     # with open(output, 'w') as fp:
