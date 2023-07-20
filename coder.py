@@ -612,7 +612,7 @@ class Coder(DefaultCoder):
         if need_logs:
             print("init models ...")
         reader = ImgReader()
-        coding_scheme = MyYinYangCode(faster=True)
+        coding_scheme = MyYinYangCode(faster=False)
         pipeline = MyPipeline(coding_scheme=coding_scheme,
                               error_correction=None,
                               need_logs=True)
@@ -623,7 +623,7 @@ class Coder(DefaultCoder):
             print("transcode bits ...")
         results = pipeline.transcode(direction="t_c",
                                      input_numpy=img_array,
-                                     dup_rate=15,
+                                     dup_rate=9,
                                      output_path='target.dna',
                                      segment_length=self.payload,
                                      index_length=self.address, index=True)
@@ -651,22 +651,23 @@ class Coder(DefaultCoder):
            The order of the samples in this DNA sequence list input must be different from
            the order of the samples output by the "image_to_dna" interface.
         """
-        if need_logs:
-            print("Decode DNA sequences based on the mapping scheme.")
-        reader = load_model(path='img_reader.pkl', need_logs=True)
-        coding_scheme = load_model(path='code_schema.pkl', need_logs=True)
-        pipeline = MyPipeline(coding_scheme=coding_scheme,
-                              error_correction=None,
-                              need_logs=True)
-        result = pipeline.transcode(direction="t_s",
-                                    segment_length=self.payload,
-                                    index_length=self.address,
-                                    dup_rate=9,
-                                    input_string=dna_sequences,
-                                    index=True)
-
-        img_np = result['bit'][:coding_scheme.bit_size]
-        img_np = np.array(img_np)
-        img_np = np.packbits(img_np)
-        img = reader.toImg(img_np, blur=False)
-        cv2.imwrite(output_image_path, img)
+        pass
+        # if need_logs:
+        #     print("Decode DNA sequences based on the mapping scheme.")
+        # reader = load_model(path='img_reader.pkl', need_logs=True)
+        # coding_scheme = load_model(path='code_schema.pkl', need_logs=True)
+        # pipeline = MyPipeline(coding_scheme=coding_scheme,
+        #                       error_correction=None,
+        #                       need_logs=True)
+        # result = pipeline.transcode(direction="t_s",
+        #                             segment_length=self.payload,
+        #                             index_length=self.address,
+        #                             dup_rate=9,
+        #                             input_string=dna_sequences,
+        #                             index=True)
+        #
+        # img_np = result['bit'][:coding_scheme.bit_size]
+        # img_np = np.array(img_np)
+        # img_np = np.packbits(img_np)
+        # img = reader.toImg(img_np, blur=False)
+        # cv2.imwrite(output_image_path, img)

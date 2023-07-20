@@ -3,4 +3,6 @@
 *.dna
 *.target
 *.txt
+*.json
+*.pkl
 __pycache__
