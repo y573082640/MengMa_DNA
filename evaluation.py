@@ -2,8 +2,9 @@ __author__ = "Zhang, Haoling [zhanghaoling@genomics.cn]"
 
 
 from copy import deepcopy
-from datetime import datetime
 from cv2 import imread
+from datetime import datetime
+from numpy import mean
 from random import seed, shuffle, random, randint, choice
 from skimage.metrics import structural_similarity
 
@@ -301,7 +302,7 @@ class EvaluationPipeline:
 
         if need_logs:
             print("Shuffle the obtained DNA sequences.")
-        # shuffle(target_dna_sequences)
+        shuffle(target_dna_sequences)
 
         if random_seed is not None:
             seed(None)
@@ -343,7 +344,7 @@ class EvaluationPipeline:
         density_score = 1 - d_number / b_number if d_number < b_number else 0
 
         # calculate the compatibility score.
-        maximum_homopolymer, maximum_gc_bias = 1, 0
+        h_statistics, gc_statistics = [], []
         for dna_sequence in dna_sequences:
             homopolymer = 1
             while True:
@@ -356,17 +357,21 @@ class EvaluationPipeline:
                     homopolymer += 1
                 else:
                     break
-            maximum_homopolymer = max(homopolymer, maximum_homopolymer)
             gc_bias = abs((dna_sequence.count("G") + dna_sequence.count("C")) / len(dna_sequence) - 0.5)
-            maximum_gc_bias = max(gc_bias, maximum_gc_bias)
+
+            h_statistics.append(homopolymer)
+            gc_statistics.append(gc_bias)
+
+        maximum_homopolymer, maximum_gc_bias = mean(h_statistics), mean(gc_statistics)
         h_score = (1.0 - (maximum_homopolymer - 1) / 5.0) / 2.0 if maximum_homopolymer < 6 else 0
         c_score = (1.0 - maximum_gc_bias / 0.3) / 2.0 if maximum_gc_bias < 0.3 else 0
+
         compatibility_score = h_score + c_score
 
         # calculate the recovery score.
         try:
             obtained_image = imread(path_2)
-            ssim_value = structural_similarity(expected_image, obtained_image, channel_axis=-1)
+            ssim_value = structural_similarity(expected_image, obtained_image, channel_axis=2)
             recovery_score = (ssim_value - 0.84) / 0.16 if ssim_value > 0.84 else 0
         except AttributeError:
             recovery_score = 0.0  # unable to parse as image, SSIM value cannot be calculated, the recovery score is 0.

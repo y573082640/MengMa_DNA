@@ -1,26 +1,35 @@
 __author__ = "Zhang, Haoling [zhanghaoling@genomics.cn]"
 
-import json
-import time
-from datetime import datetime
-from statistics import mode
-import numpy as np
 import copy
-import cv2
-from Chamaeleo.utils.data_handle import save_model, load_model
-
-from evaluation import DefaultCoder
+import queue
+import time
 from collections import defaultdict
-from random import seed, shuffle, random, randint, choice
-from numpy import array, zeros, arange, fromfile, packbits, unpackbits, expand_dims, concatenate, add
-from numpy import log2, sum, ceil, where, uint8, uint64
+from datetime import datetime
+from itertools import product
+from random import choice
+from statistics import mode
+
+import cv2
+import numpy as np
+from Chamaeleo.methods.ecc import ReedSolomon,Hamming
+from Chamaeleo.methods.flowed import YinYangCode, DNAFountain
+from Chamaeleo.methods.inherent import base_index
+from Chamaeleo.utils import data_handle, indexer
+from Chamaeleo.utils.data_handle import save_model, load_model
+from Chamaeleo.utils.indexer import divide
 from Chamaeleo.utils.monitor import Monitor
 from Chamaeleo.utils.pipelines import TranscodePipeline
-from Chamaeleo.utils import data_handle, indexer
-from Chamaeleo.utils.indexer import divide
-from Chamaeleo.methods.flowed import YinYangCode
-from Chamaeleo.methods.inherent import base_index, index_base
-from Chamaeleo.methods.ecc import ReedSolomon, Hamming
+from numpy import array
+from numpy import ceil
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+
+from evaluation import DefaultCoder
+
+kmers_2 = [''.join(p) for p in product('ACGT', repeat=2)]
+kmers_3 = ["".join(p) for p in product("ACGT", repeat=3)]
+kmers_4 = ["".join(p) for p in product("ACGT", repeat=4)]
 
 
 ######################################## 针对读入的操作,添加聚类
@@ -101,9 +110,11 @@ def list_to_indexed_dict(lst):
         indexed_dict[index] = value
     return indexed_dict
 
+
 def are_all_elements_same(tuple_obj):
     # Check if all elements in the tuple are the same
     return all(element == tuple_obj[0] for element in tuple_obj)
+
 
 def get_dna_index_map(dna_bits_map, indices_of_bit_segments, max_bit_index):
     """
@@ -185,17 +196,19 @@ class MyPipeline(TranscodePipeline):
                     self.records["error-correction length"] = 0
 
                 results = self.coding_scheme.silicon_to_carbon(bit_segments, bit_size)
+                dna_sequences = results['dna']
 
-                dna_sequences = []
-                ## 冗余复制次数
-                print('dna seq nums:', len(dna_sequences))
-                if "dup_rate" in info and info["dup_rate"]:
-                    for s in results["dna"]:
-                        dna_sequences += [s] * info["dup_rate"]
-                else:
-                    dna_sequences = results["dna"]
-                print('dna seq nums after replicate:', len(dna_sequences))
-                ##
+                # dna_sequences = []
+                # ## 冗余复制次数
+                # print('dna seq nums:', len(dna_sequences))
+                # if "dup_rate" in info and info["dup_rate"]:
+                #     for s in results["dna"]:
+                #         dna_sequences += [s] * info["dup_rate"]
+                # else:
+                #     dna_sequences = results["dna"]
+                # print('dna seq nums after replicate:', len(dna_sequences))
+                # ##
+
                 self.records["information density"] = round(results["i"], 3)
                 self.records["encoding runtime"] = round(results["t"], 3)
 
@@ -217,47 +230,48 @@ class MyPipeline(TranscodePipeline):
                 dna_sequences = [list(i) for i in dna_sequences]
                 original_dna_sequences = copy.deepcopy(dna_sequences)
 
-                # 冗余重建
-                # 获取dna和bit段的对应关系
-                max_bit_index = self.coding_scheme.dna_count * 2 ## 此处是针对阴阳码的 hard code
-
-                result = self.coding_scheme.carbon_to_silicon(dna_sequences)  # dna_bits_map 记录DNA和bit段的对应关系,一对多或者一对一
-                dup_bit_segments = result['bit']
-                dna_bits_map = result['map']
-                print(len(dna_sequences), len(dup_bit_segments), len(dna_bits_map))
-
-                # 获取纠错后的bit段
-                if self.error_correction is not None:
-                    remove_result = self.error_correction.remove(dup_bit_segments)
-                    verified_dup_bit_segments = remove_result['bit']
-                    print(remove_result['e_r'], len(remove_result['e_bit']))
-                else:
-                    verified_dup_bit_segments = dup_bit_segments
-                print(len(verified_dup_bit_segments))
-                # 获取bit段的index
-                indices_of_bit_segments, _ = indexer.divide_all(verified_dup_bit_segments,
-                                                                info["index_length"],
-                                                                self.need_logs)  # indices_of_bit_segments
-                print('indices_of_bit_segments len and max : ', len(indices_of_bit_segments),
-                      max(indices_of_bit_segments))
-                print('total count of bit seqs: ', max_bit_index)
-                # 记录bit段的index,一对一
-                # 根据index聚类dna,index突变的就不要了
-                index_copies_map = get_dna_index_map(dna_bits_map, indices_of_bit_segments, max_bit_index)
-                # 得到copy后重建可信dna序列
-                remove_dup_dna_seqs = []
-                print('dna seq nums before rebuild:', len(original_dna_sequences))
-                print('dna seq nums rebuild groups:', len(index_copies_map.values()))
-                for index, copies in index_copies_map.items():
-                    mutated_seqs = ["".join(original_dna_sequences[i]) for i in copies]
-                    # 众数为长度
-                    mode_val = mode([len(_) for _ in mutated_seqs])
-                    rebuild_result = bislide_recover(mutated_seqs, seq_len=mode_val)
-                    remove_dup_dna_seqs.append(list(rebuild_result))
-                # 重建结束，正式解码
-                print('dna seq nums after rebuild:', len(remove_dup_dna_seqs))
-                remove_dup_dna_seqs = copy.deepcopy(remove_dup_dna_seqs)  # 防止影响到原始的original_dna_sequences
-                results = self.coding_scheme.carbon_to_silicon(remove_dup_dna_seqs)
+                # # 冗余重建
+                # # 获取dna和bit段的对应关系
+                # max_bit_index = self.coding_scheme.dna_count * 2  ## 此处是针对阴阳码的 hard code
+                #
+                # result = self.coding_scheme.carbon_to_silicon(dna_sequences)  # dna_bits_map 记录DNA和bit段的对应关系,一对多或者一对一
+                # dup_bit_segments = result['bit']
+                # dna_bits_map = result['map']
+                # print(len(dna_sequences), len(dup_bit_segments), len(dna_bits_map))
+                #
+                # # 获取纠错后的bit段
+                # if self.error_correction is not None:
+                #     remove_result = self.error_correction.remove(dup_bit_segments)
+                #     verified_dup_bit_segments = remove_result['bit']
+                #     print(remove_result['e_r'], len(remove_result['e_bit']))
+                # else:
+                #     verified_dup_bit_segments = dup_bit_segments
+                # print(len(verified_dup_bit_segments))
+                # # 获取bit段的index
+                # indices_of_bit_segments, _ = indexer.divide_all(verified_dup_bit_segments,
+                #                                                 info["index_length"],
+                #                                                 self.need_logs)  # indices_of_bit_segments
+                # print('indices_of_bit_segments len and max : ', len(indices_of_bit_segments),
+                #       max(indices_of_bit_segments))
+                # print('total count of bit seqs: ', max_bit_index)
+                # # 记录bit段的index,一对一
+                # # 根据index聚类dna,index突变的就不要了
+                # index_copies_map = get_dna_index_map(dna_bits_map, indices_of_bit_segments, max_bit_index)
+                # # 得到copy后重建可信dna序列
+                # remove_dup_dna_seqs = []
+                # print('dna seq nums before rebuild:', len(original_dna_sequences))
+                # print('dna seq nums rebuild groups:', len(index_copies_map.values()))
+                # for index, copies in index_copies_map.items():
+                #     mutated_seqs = ["".join(original_dna_sequences[i]) for i in copies]
+                #     # 众数为长度
+                #     mode_val = mode([len(_) for _ in mutated_seqs])
+                #     rebuild_result = bislide_recover(mutated_seqs, seq_len=mode_val)
+                #     remove_dup_dna_seqs.append(list(rebuild_result))
+                # # 重建结束，正式解码
+                # print('dna seq nums after rebuild:', len(remove_dup_dna_seqs))
+                # remove_dup_dna_seqs = copy.deepcopy(remove_dup_dna_seqs)  # 防止影响到原始的original_dna_sequences
+                # results = self.coding_scheme.carbon_to_silicon(remove_dup_dna_seqs)
+                results = self.coding_scheme.carbon_to_silicon(dna_sequences)
                 self.records["decoding runtime"] = round(results["t"], 3)
 
                 bit_segments = results["bit"]
@@ -283,14 +297,16 @@ class MyPipeline(TranscodePipeline):
                 if not bit_segments:
                     return {"bit": None, "dna": original_dna_sequences}
 
-                total_count = self.coding_scheme.total_count
+                # total_count = self.coding_scheme.total_count
                 if "index" in info and info["index"]:
                     if "index_length" in info:
-                        indices, bit_segments = my_divide_all(bit_segments, info["index_length"], self.need_logs,
-                                                              total_count)
+                        # indices, bit_segments = my_divide_all(bit_segments, info["index_length"], self.need_logs,
+                        #                                       total_count)
+                        indices, bit_segments = indexer.divide_all(bit_segments, info["index_length"], self.need_logs)
                     else:
-                        indices, bit_segments = my_divide_all(bit_segments, None, self.need_logs,
-                                                              total_count)
+                        # indices, bit_segments = my_divide_all(bit_segments, None, self.need_logs,
+                        #                                       total_count)
+                        indices, bit_segments = indexer.divide_all(bit_segments, None, self.need_logs)
 
                     bit_segments = indexer.sort_order(indices, bit_segments, self.need_logs)
 
@@ -439,46 +455,6 @@ class MyYinYangCode(YinYangCode):
         return bit_segments, dna_bits_map
 
 
-######################################## 读入图像的操作
-## author:ydh
-class ImgReader:
-    def __init__(self):
-        self.sample_rate = None
-
-    def readImg(self, filepath: str, down_sample: bool) -> array:
-        image = cv2.imread(filepath)
-        if down_sample:
-            # 调整图像尺寸
-            for ratio_width in [4, 3, 2, 1]:
-                if image.shape[1] % ratio_width == 0:
-                    new_width = image.shape[1] // ratio_width
-                    break
-            for ratio_height in [4, 3, 2, 1]:
-                if image.shape[0] % ratio_width == 0:
-                    new_height = image.shape[0] // ratio_height
-                    break
-            downsampled_image = cv2.resize(image, (new_width, new_height))
-            self.sample_rate = (ratio_width, ratio_height)
-        else:
-            downsampled_image = image
-        # Encode image to PNG format in memory buffer
-        encoded_img = cv2.imencode('.bmp', downsampled_image)[1]
-        # Convert to NumPy array
-        encoded_img_np = np.array(encoded_img)
-        return encoded_img_np
-
-    def toImg(self, img_array: array, blur: bool):
-        # 解码
-        decoded_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
-        rows, cols, _channels = map(int, decoded_img.shape)
-        # 去噪
-        if blur:
-            decoded_img = cv2.medianBlur(decoded_img, 3)
-        # 还原
-        if self.sample_rate is not None:
-            decoded_img = cv2.resize(decoded_img, (cols * self.sample_rate[0], rows * self.sample_rate[1]))
-        return decoded_img
-
 
 ######################################## 从错误中恢复的代码
 ## author:xyc
@@ -567,6 +543,245 @@ def cal_acc(ori_seq, rec_seq):
     return len([ii for ii in range(len(ori_seq)) if ori_seq[ii] == rec_seq[ii]]) / len(ori_seq)
 
 
+######################################## 聚类算法相关
+
+def get_subseq_features(dna_seq, sub_len):
+    seq_len = len(dna_seq)
+    subseq_len = seq_len // sub_len
+    features = []
+    for i in range(sub_len):
+        subseq = dna_seq[i * subseq_len: (i + 1) * subseq_len]
+        comps = [subseq.count(nuc) / subseq_len * 10 for nuc in 'ATCG']
+        features.extend(comps)
+    return features
+
+
+def get_kmer_features(dna_seq, kmer_len=2):
+    kmer_counts = dict()
+    for kmer in kmers_3:
+        kmer_counts[kmer] = dna_seq.count(kmer)
+    kmer_features = list(kmer_counts.values())
+    return kmer_features
+
+
+# 拼接特征
+def get_features(seqs, n_components, sub_len, kmer_len):
+    subseq_features = np.array([get_subseq_features(seq, sub_len) for seq in seqs])
+    kmer_features = np.array([get_kmer_features(seq, kmer_len) for seq in seqs])
+    seq_fearures = np.concatenate((kmer_features, subseq_features), axis=1)
+    seq_fearures = (seq_fearures - seq_fearures.mean(axis=0)) / seq_fearures.std(axis=0)
+    # PCA
+    if n_components is not None:
+        pca = PCA(n_components=n_components)
+        pca.fit(seq_fearures)
+        seq_fearures = pca.transform(seq_fearures)
+        print('所保留的n个成分各自的方差百分比:', pca.explained_variance_ratio_)
+        print('所保留的n个成分各自的方差值:', pca.explained_variance_)
+        print(seq_fearures.shape)
+    return seq_fearures
+
+
+def k_distance(features, k):
+    neigh = NearestNeighbors(n_neighbors=k)
+    neigh.fit(features)
+    distances, indices = neigh.kneighbors(features)
+    max_dist = np.squeeze(distances[:, -1])
+    ## 90中位数
+    a_sorted = np.sort(max_dist)
+    percentile_995 = int(0.995 * len(a_sorted))
+    percentile_001 = int(0.001 * len(a_sorted))
+    percentile_995 = a_sorted[percentile_995]
+    percentile_001 = a_sorted[percentile_001]
+    avg = np.average(a_sorted)
+    mid = np.median(a_sorted)
+    ## 输出
+    print(mid, percentile_995, percentile_001, avg)
+    return mid, percentile_995, percentile_001, avg
+
+
+def divide_index_into_clusters(labels, index_of_seqs):
+    assert len(labels) == len(index_of_seqs)
+    label_to_seqs = defaultdict(list)
+    abnormal_ones = []
+    for index, label in zip(index_of_seqs, labels):
+        if label == -1:
+            abnormal_ones.append(index)
+        else:
+            label_to_seqs[label].append(index)
+    return abnormal_ones, list(label_to_seqs.values())
+
+
+def level2_pass(seq_features, index_of_seqs, min_samples, eps):
+    """
+    适用于大数样本和类别的粗分类
+    """
+    model = DBSCAN(eps=eps, min_samples=min_samples).fit(seq_features)
+    labels = model.labels_
+    result_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+    result_noise_ = list(labels).count(-1)
+    print("Rough Pass Sample number: %d" % len(index_of_seqs))
+    print("Estimated number of clusters: %d" % result_clusters_)
+    print("Estimated number of noise points: %d" % result_noise_)
+    print('-' * 20)
+    return divide_index_into_clusters(labels, index_of_seqs)
+
+
+def level3_pass(seq_features, index_of_seqs, n_cluster):
+    """
+    适用于少数样本和类别的精确分类
+    """
+    model = KMeans(n_clusters=n_cluster, init='k-means++', n_init=10).fit(seq_features)
+    return divide_index_into_clusters(model.labels_, index_of_seqs)
+
+
+def cluster_pipeline(dna_seqs, n_cluster, copy_num, pca_component=None, rough_threshold=3000):
+    print('get dna seqs features ... ')
+    seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
+    mid, percentile_995, percentile_001, avg = k_distance(seq_features, copy_num)
+    eps, min_eps = max(np.ceil(percentile_995), percentile_995 + 0.4), np.floor(
+        percentile_001)  ## cluster_pipeline只适用于喷泉码结果，阴阳码结果聚类密度差距过大，该方法不适用
+    pipeline = queue.Queue()
+    pipeline.put((n_cluster, range(len(dna_seqs))))
+    results = []
+    print('start queue clustering  ... ')
+    epoch = 0
+
+    while pipeline.empty() is False:
+        print('cluster round:', epoch)
+        epoch += 1
+        if eps <= min_eps:
+            break
+        tmp_num_cluster, remained_indices = pipeline.get()
+        print('eps:{},remain number:{},cluster number:{}'.format(eps, len(remained_indices), tmp_num_cluster))
+        remain_results, rets = cluster(seq_features, remained_indices, copy_num, eps, rough_threshold)
+        results += rets
+        if len(remain_results) > rough_threshold:
+            assert len(remain_results) % copy_num == 0
+            tmp_num_cluster = ceil(len(remain_results) / copy_num)
+            pipeline.put((tmp_num_cluster, remain_results))
+        elif n_cluster > len(results):
+            _, final_result = level3_pass(seq_features[remain_results], remain_results, n_cluster - len(results))
+            results += final_result
+            break
+        eps = eps - 0.2
+
+    while pipeline.empty() is False:
+        tmp_num_cluster, remained_indices = pipeline.get()
+        _, final_result = level3_pass(seq_features[remained_indices], remained_indices, tmp_num_cluster)
+        results += final_result
+
+    length_of_result = list(map(len, results))
+    print("clustering results is {}/{}, length of group between {} to {}".format(
+        len(results),
+        n_cluster,
+        min(length_of_result),
+        max(length_of_result))
+    )
+
+    ret = []
+    for group in results:
+        ret.append([dna_seqs[i] for i in group])
+    return ret
+
+
+def cluster(seq_features, indices, copy_num, avg_dist, rough_threshold):
+    """
+    使用队列完成不同层次的聚类聚类法
+    :param seq_features: 输入的dna 特征
+    :param rough_threshold 区分采用哪种聚类方法的阈值
+    :param copy_num : 复制比例
+    :param avg_dist 用于确定eps
+    :param indices dna特征中的未分类下标
+    """
+
+    result = []
+    abnormal_result = []
+    cluster_queue = queue.Queue()
+    rough_time, refine_time = 0, 0
+    total_refine_sample = 0
+    cluster_queue.put((-1, indices))
+    round_count = 0
+    while cluster_queue.empty() is False:
+        round_count += 1
+        last_iter_eps, copy_group = cluster_queue.get()
+        this_iter_eps = last_iter_eps + 1
+        num_of_cluster = int(ceil(len(copy_group) / copy_num))
+        if len(copy_group) == copy_num:
+            result.append(copy_group)
+        elif len(copy_group) < copy_num:
+            abnormal_result += copy_group
+        else:
+            if len(copy_group) > rough_threshold and this_iter_eps <= 1:
+                ## 二级聚类
+                start = time.time()
+                abnormal_ones, label_of_indices = level2_pass(seq_features[copy_group],
+                                                              index_of_seqs=copy_group,
+                                                              min_samples=copy_num // 2,
+                                                              eps=avg_dist)
+                end = time.time()
+                rough_time += end - start
+            elif len(copy_group) <= rough_threshold:
+                ## 三级聚类
+                total_refine_sample += len(copy_group)
+                start = time.time()
+                abnormal_ones, label_of_indices = level3_pass(seq_features[copy_group], copy_group, num_of_cluster)
+                end = time.time()
+                refine_time += end - start
+            else:
+                abnormal_ones = copy_group
+                label_of_indices = []
+            for k in label_of_indices:
+                cluster_queue.put((this_iter_eps + 1, k))
+            abnormal_result += abnormal_ones
+
+    print('rough cost is {}s, refine cost is {}s'.format(round(rough_time, 3), round(refine_time, 3)))
+    print('refine sample number is {},abnormal sample number is {} '.format(total_refine_sample,
+                                                                            len(abnormal_result)))
+    return abnormal_result, result
+
+
+######################################## 读入图像的操作
+## author:ydh
+class ImgReader:
+    def __init__(self,encode_format):
+        self.sample_rate = None
+        self.encode_format = encode_format
+
+    def readImg(self, filepath: str, down_sample: bool) -> array:
+        image = cv2.imread(filepath)
+        if down_sample:
+            # 调整图像尺寸
+            for ratio_width in [4, 3, 2, 1]:
+                if image.shape[1] % ratio_width == 0:
+                    new_width = image.shape[1] // ratio_width
+                    break
+            for ratio_height in [4, 3, 2, 1]:
+                if image.shape[0] % ratio_width == 0:
+                    new_height = image.shape[0] // ratio_height
+                    break
+            downscaledimage = cv2.resize(image, (new_width, new_height))
+            self.sample_rate = (ratio_width, ratio_height)
+        else:
+            downscaledimage = image
+        # Encode image to PNG format in memory buffer
+        encoded_img = cv2.imencode(self.encode_format, downscaledimage)[1]
+        # Convert to NumPy array
+        encoded_img_np = np.array(encoded_img)
+        return encoded_img_np
+
+    def toImg(self, img_array: array, blur: bool):
+        # 解码
+        decoded_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+        rows, cols, _channels = map(int, decoded_img.shape)
+        # 去噪
+        if blur:
+            decoded_img = cv2.medianBlur(decoded_img, 3)
+        # 还原
+        print(self.sample_rate)
+        if self.sample_rate is not None:
+            decoded_img = cv2.resize(decoded_img, (cols * self.sample_rate[0], rows * self.sample_rate[1]))
+        return decoded_img
+
 ######################################## 需要我们自己实现的Coder
 
 class Coder(DefaultCoder):
@@ -591,9 +806,14 @@ class Coder(DefaultCoder):
 
         """
         super().__init__(team_id=team_id)
-        self.address, self.payload = 18, 184 - 18
+        self.address, self.payload = 20, 160
         self.check_size = 4
         self.supplement, self.message_number = 0, 0
+        self.copy_num, self.n_cluster = 9, None
+        self.seq_len = Hamming()
+        self.coding_scheme = DNAFountain(redundancy=2)
+        self.error_correction = Hamming()
+        self.reader = ImgReader(encode_format='.jpg')
 
     def image_to_dna(self, input_image_path, need_logs=True):
         """
@@ -614,28 +834,23 @@ class Coder(DefaultCoder):
         """
         if need_logs:
             print("init models ...")
-        reader = ImgReader()
-        coding_scheme = MyYinYangCode(faster=False)
-        pipeline = MyPipeline(coding_scheme=coding_scheme,
-                              error_correction=Hamming(),
+        pipeline = MyPipeline(coding_scheme=self.coding_scheme,
+                              error_correction=self.error_correction,
                               need_logs=True)
         if need_logs:
             print("read img ...")
-        img_array = reader.readImg(input_image_path, True)
+        img_array = self.reader.readImg(input_image_path, False)
         if need_logs:
             print("transcode bits ...")
         results = pipeline.transcode(direction="t_c",
                                      input_numpy=img_array,
-                                     dup_rate=9,
                                      output_path='target.dna',
                                      segment_length=self.payload,
                                      index_length=self.address, index=True)
-        if need_logs:
-            print("save model ...")
-        save_model(path='code_schema.pkl', model=coding_scheme, need_logs=True)
-        save_model(path='img_reader.pkl', model=reader, need_logs=True)
         dna_sequences = ["".join(_) for _ in results['dna']]
-        return dna_sequences
+        self.n_cluster = len(dna_sequences)
+        self.seq_len = len(dna_sequences[0])
+        return dna_sequences * self.copy_num
 
     def dna_to_image(self, dna_sequences, output_image_path, need_logs=True):
         """
@@ -654,23 +869,20 @@ class Coder(DefaultCoder):
            The order of the samples in this DNA sequence list input must be different from
            the order of the samples output by the "image_to_dna" interface.
         """
-        pass
-        # if need_logs:
-        #     print("Decode DNA sequences based on the mapping scheme.")
-        # reader = load_model(path='img_reader.pkl', need_logs=True)
-        # coding_scheme = load_model(path='code_schema.pkl', need_logs=True)
-        # pipeline = MyPipeline(coding_scheme=coding_scheme,
-        #                       error_correction=None,
-        #                       need_logs=True)
-        # result = pipeline.transcode(direction="t_s",
-        #                             segment_length=self.payload,
-        #                             index_length=self.address,
-        #                             dup_rate=9,
-        #                             input_string=dna_sequences,
-        #                             index=True)
-        #
-        # img_np = result['bit'][:coding_scheme.bit_size]
-        # img_np = np.array(img_np)
-        # img_np = np.packbits(img_np)
-        # img = reader.toImg(img_np, blur=False)
-        # cv2.imwrite(output_image_path, img)
+        if need_logs:
+            print("Decode DNA sequences based on the mapping scheme.")
+        grouped_dna_sequences = cluster_pipeline(dna_sequences, self.n_cluster, self.copy_num, None)
+        rebuild_dna_sequences = [bislide_recover(g, self.seq_len) for g in grouped_dna_sequences]
+        pipeline = MyPipeline(coding_scheme=self.coding_scheme,
+                              error_correction=self.error_correction,
+                              need_logs=True)
+        result = pipeline.transcode(direction="t_s",
+                                    segment_length=self.payload,
+                                    index_length=self.address,
+                                    input_string=rebuild_dna_sequences,
+                                    index=True)
+        img_np = np.array(result['bit'])
+        img_np = np.packbits(img_np)
+        img = self.reader.toImg(img_np, blur=False)
+        print(img.shape)
+        cv2.imwrite(output_image_path, img)
