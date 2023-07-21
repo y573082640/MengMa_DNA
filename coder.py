@@ -11,7 +11,7 @@ from statistics import mode
 
 import cv2
 import numpy as np
-from Chamaeleo.methods.ecc import ReedSolomon
+from Chamaeleo.methods.ecc import ReedSolomon,Hamming
 from Chamaeleo.methods.flowed import YinYangCode, DNAFountain
 from Chamaeleo.methods.inherent import base_index
 from Chamaeleo.utils import data_handle, indexer
@@ -455,48 +455,6 @@ class MyYinYangCode(YinYangCode):
         return bit_segments, dna_bits_map
 
 
-######################################## 读入图像的操作
-## author:ydh
-class ImgReader:
-    def __init__(self,encode_format):
-        self.sample_rate = None
-        self.encode_format = encode_format
-
-    def readImg(self, filepath: str, down_sample: bool) -> array:
-        image = cv2.imread(filepath)
-        if down_sample:
-            # 调整图像尺寸
-            for ratio_width in [4, 3, 2, 1]:
-                if image.shape[1] % ratio_width == 0:
-                    new_width = image.shape[1] // ratio_width
-                    break
-            for ratio_height in [4, 3, 2, 1]:
-                if image.shape[0] % ratio_width == 0:
-                    new_height = image.shape[0] // ratio_height
-                    break
-            downscaledimage = cv2.resize(image, (new_width, new_height))
-            self.sample_rate = (ratio_width, ratio_height)
-        else:
-            downscaledimage = image
-        # Encode image to PNG format in memory buffer
-        encoded_img = cv2.imencode(self.encode_format, downscaledimage)[1]
-        # Convert to NumPy array
-        encoded_img_np = np.array(encoded_img)
-        return encoded_img_np
-
-    def toImg(self, img_array: array, blur: bool):
-        # 解码
-        decoded_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
-        rows, cols, _channels = map(int, decoded_img.shape)
-        # 去噪
-        if blur:
-            decoded_img = cv2.medianBlur(decoded_img, 3)
-        # 还原
-        print(self.sample_rate)
-        if self.sample_rate is not None:
-            decoded_img = cv2.resize(decoded_img, (cols * self.sample_rate[0], rows * self.sample_rate[1]))
-        return decoded_img
-
 
 ######################################## 从错误中恢复的代码
 ## author:xyc
@@ -782,6 +740,48 @@ def cluster(seq_features, indices, copy_num, avg_dist, rough_threshold):
     return abnormal_result, result
 
 
+######################################## 读入图像的操作
+## author:ydh
+class ImgReader:
+    def __init__(self,encode_format):
+        self.sample_rate = None
+        self.encode_format = encode_format
+
+    def readImg(self, filepath: str, down_sample: bool) -> array:
+        image = cv2.imread(filepath)
+        if down_sample:
+            # 调整图像尺寸
+            for ratio_width in [4, 3, 2, 1]:
+                if image.shape[1] % ratio_width == 0:
+                    new_width = image.shape[1] // ratio_width
+                    break
+            for ratio_height in [4, 3, 2, 1]:
+                if image.shape[0] % ratio_width == 0:
+                    new_height = image.shape[0] // ratio_height
+                    break
+            downscaledimage = cv2.resize(image, (new_width, new_height))
+            self.sample_rate = (ratio_width, ratio_height)
+        else:
+            downscaledimage = image
+        # Encode image to PNG format in memory buffer
+        encoded_img = cv2.imencode(self.encode_format, downscaledimage)[1]
+        # Convert to NumPy array
+        encoded_img_np = np.array(encoded_img)
+        return encoded_img_np
+
+    def toImg(self, img_array: array, blur: bool):
+        # 解码
+        decoded_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+        rows, cols, _channels = map(int, decoded_img.shape)
+        # 去噪
+        if blur:
+            decoded_img = cv2.medianBlur(decoded_img, 3)
+        # 还原
+        print(self.sample_rate)
+        if self.sample_rate is not None:
+            decoded_img = cv2.resize(decoded_img, (cols * self.sample_rate[0], rows * self.sample_rate[1]))
+        return decoded_img
+
 ######################################## 需要我们自己实现的Coder
 
 class Coder(DefaultCoder):
@@ -806,13 +806,13 @@ class Coder(DefaultCoder):
 
         """
         super().__init__(team_id=team_id)
-        self.address, self.payload = 20, 140
+        self.address, self.payload = 20, 160
         self.check_size = 4
         self.supplement, self.message_number = 0, 0
         self.copy_num, self.n_cluster = 9, None
-        self.seq_len = None
-        self.coding_scheme = DNAFountain(redundancy=0.5)
-        self.error_correction = ReedSolomon(check_size=8)
+        self.seq_len = Hamming()
+        self.coding_scheme = DNAFountain(redundancy=2)
+        self.error_correction = Hamming()
         self.reader = ImgReader(encode_format='.jpg')
 
     def image_to_dna(self, input_image_path, need_logs=True):
