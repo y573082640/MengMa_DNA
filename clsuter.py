@@ -1,22 +1,14 @@
 from itertools import product
 import json
-from sklearn.cluster import KMeans, MiniBatchKMeans, AgglomerativeClustering, MeanShift, OPTICS, HDBSCAN
-from sklearn.cluster import BisectingKMeans
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.cluster import KMeans, BisectingKMeans, DBSCAN, HDBSCAN
 from sklearn.decomposition import PCA
 from random import shuffle
 import scipy.spatial.distance as dist
-from scipy.spatial.distance import pdist, squareform
-from collections import defaultdict
 import numpy as np
-from sklearn import metrics
-from sklearn.cluster import DBSCAN
-from scipy.cluster.hierarchy import DisjointSet
 from collections import defaultdict
 import queue
 import time
 from numpy import ceil
-import multiprocessing as mp
 from sklearn.neighbors import NearestNeighbors
 
 kmers_2 = [''.join(p) for p in product('ACGT', repeat=2)]
@@ -55,7 +47,6 @@ def get_sequences_from_fasta(file_path, copy_num):
 def get_subseq_features(dna_seq, sub_len):
     seq_len = len(dna_seq)
     subseq_len = seq_len // sub_len
-    assert seq_len % sub_len != 0
     features = []
     for i in range(sub_len):
         subseq = dna_seq[i * subseq_len: (i + 1) * subseq_len]
@@ -64,27 +55,35 @@ def get_subseq_features(dna_seq, sub_len):
     return features
 
 
-# 构建所有可能的k-mer子序列
 def get_kmer_features(dna_seq, kmer_len=2):
-    # 将DNA序列分成4段
-    seq_len = len(dna_seq)
-    segment_len = 48
-    seq_segments = [dna_seq[i:i+segment_len] for i in range(0, segment_len * 4, segment_len)]
-
-    kmer_features = []
-    for segment in seq_segments:
-        kmer_counts = dict()
-        if kmer_len == 3:
-            for kmer in kmers_3:
-                kmer_counts[kmer] = segment.count(kmer)
-        elif kmer_len == 2:
-            for kmer in kmers_2:
-                kmer_counts[kmer] = segment.count(kmer)
-        elif kmer_len == 4:
-            for kmer in kmers_4:
-                kmer_counts[kmer] = segment.count(kmer)
-        kmer_features.extend(list(kmer_counts.values()))
+    kmer_counts = dict()
+    for kmer in kmers_3:
+        kmer_counts[kmer] = dna_seq.count(kmer)
+    kmer_features = list(kmer_counts.values())
     return kmer_features
+
+
+# 构建所有可能的k-mer子序列
+# def get_kmer_features(dna_seq, kmer_len=2):
+#     # 将DNA序列分成4段
+#     seq_len = len(dna_seq)
+#     segment_len = 48
+#     seq_segments = [dna_seq[i:i + segment_len] for i in range(0, segment_len * 4, segment_len)]
+#
+#     kmer_features = []
+#     for segment in seq_segments:
+#         kmer_counts = dict()
+#         if kmer_len == 3:
+#             for kmer in kmers_3:
+#                 kmer_counts[kmer] = segment.count(kmer)
+#         elif kmer_len == 2:
+#             for kmer in kmers_2:
+#                 kmer_counts[kmer] = segment.count(kmer)
+#         elif kmer_len == 4:
+#             for kmer in kmers_4:
+#                 kmer_counts[kmer] = segment.count(kmer)
+#         kmer_features.extend(list(kmer_counts.values()))
+#     return kmer_features
 
 
 # 拼接特征
@@ -159,18 +158,19 @@ def level3_pass(seq_features, index_of_seqs, n_cluster):
 def cluster_pipeline(dna_seqs, n_cluster, copy_num, pca_component=None, rough_threshold=3000):
     print('get dna seqs features ... ')
     seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
-    min_eps, max_eps = 3, 8
-    eps = min_eps
+    mid, percentile_995, percentile_001, avg = k_distance(seq_features, copy_num)
+    eps, min_eps = max(np.ceil(percentile_995), percentile_995 + 0.4), np.floor(percentile_001)  ## cluster_pipeline只适用于喷泉码结果，阴阳码结果聚类密度差距过大，该方法不适用
     pipeline = queue.Queue()
     pipeline.put((n_cluster, range(len(dna_seqs))))
     results = []
     print('start queue clustering  ... ')
     epoch = 0
+
     while pipeline.empty() is False:
-        print('epoch:', epoch)
+        print('cluster round:', epoch)
         epoch += 1
-        if eps >= max_eps:
-            exit(-2)
+        if eps <= min_eps:
+            break
         tmp_num_cluster, remained_indices = pipeline.get()
         print('eps:{},remain number:{},cluster number:{}'.format(eps, len(remained_indices), tmp_num_cluster))
         remain_results, rets = cluster(seq_features, remained_indices, copy_num, eps, rough_threshold)
@@ -183,7 +183,13 @@ def cluster_pipeline(dna_seqs, n_cluster, copy_num, pca_component=None, rough_th
             _, final_result = level3_pass(seq_features[remain_results], remain_results, n_cluster - len(results))
             results += final_result
             break
-        eps = eps + 0.25
+        eps = eps - 0.2
+
+    while pipeline.empty() is False:
+        tmp_num_cluster, remained_indices = pipeline.get()
+        _, final_result = level3_pass(seq_features[remained_indices], remained_indices, tmp_num_cluster)
+        results += final_result
+
     length_of_result = list(map(len, results))
     print("clustering results is {}/{}, length of group between {} to {}".format(
         len(results),
@@ -192,12 +198,15 @@ def cluster_pipeline(dna_seqs, n_cluster, copy_num, pca_component=None, rough_th
         max(length_of_result))
     )
 
+    ret = []
+    for group in results:
+        ret.append([dna_seqs[i] for i in group])
+    return ret
 
-def cluster(seq_features, indices, copy_num, avg_dist=6.4, rough_threshold=3000):
+
+def cluster(seq_features, indices, copy_num, avg_dist, rough_threshold):
     """
     使用队列完成不同层次的聚类聚类法
-    6.4为大多数cluster内平均最大距离,因此eps设置在[5.7,6.2]之间
-    40w条数据 210秒
     :param seq_features: 输入的dna 特征
     :param rough_threshold 区分采用哪种聚类方法的阈值
     :param copy_num : 复制比例
@@ -251,30 +260,11 @@ def cluster(seq_features, indices, copy_num, avg_dist=6.4, rough_threshold=3000)
     return abnormal_result, result
 
 
-def test_max_eps(filepath, iter_time, pca_component, copy_num):
+def test_max_eps(filepath, pca_component, copy_num):
     n_clusters, dna_seqs = get_sequences_from_fasta(filepath, copy_num=copy_num)
-    t1_avg_dist, t2_avg_max_inner_dist, max_inner_dist = [], [], 0
     shuffle(dna_seqs)
     seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
-    k_distance(seq_features, copy_num + 1)
-    # index_list = range(len(seq_features))
-    # for i in range(iter_time):
-    #     chosen_list = np.random.choice(index_list, n_clusters * 3, False)
-    #     chosen_list = seq_features[chosen_list]
-    #     model = KMeans(n_clusters=n_clusters).fit(chosen_list)
-    #     labels = model.labels_
-    #     unique, counts = np.unique(labels, return_counts=True)
-    #     print(dict(zip(unique, counts)))
-    #     avg_dist, avg_max_inner_dist, tmp = cal_dist(chosen_list, labels)
-    #     t1_avg_dist.append(avg_dist)
-    #     t2_avg_max_inner_dist.append(avg_max_inner_dist)
-    #     max_inner_dist = max(max_inner_dist, tmp)
-    #
-    # print("pca_component is {}, iter time is {}, result is :".format(pca_component, iter_time),
-    #       np.average(t1_avg_dist),
-    #       np.average(t2_avg_max_inner_dist),
-    #       max_inner_dist)
-    return t1_avg_dist, t2_avg_max_inner_dist, max_inner_dist
+    return k_distance(seq_features, copy_num)
 
 
 def k_distance(features, k):
@@ -284,15 +274,15 @@ def k_distance(features, k):
     max_dist = np.squeeze(distances[:, -1])
     ## 90中位数
     a_sorted = np.sort(max_dist)
-    percentile_90 = int(0.99 * len(a_sorted))
-    percentile_10 = int(0.01 * len(a_sorted))
-    percentile_90 = a_sorted[percentile_90]
-    percentile_10 = a_sorted[percentile_10]
+    percentile_995 = int(0.995 * len(a_sorted))
+    percentile_001 = int(0.001 * len(a_sorted))
+    percentile_995 = a_sorted[percentile_995]
+    percentile_001 = a_sorted[percentile_001]
     avg = np.average(a_sorted)
     mid = np.median(a_sorted)
     ## 输出
-    print(mid, percentile_90, percentile_10, avg)
-    return mid, percentile_90, percentile_10, avg
+    print(mid, percentile_995, percentile_001, avg)
+    return mid, percentile_995, percentile_001, avg
 
 
 def test_hdbscan(dna_seqs, copy_num, pca_component=None):
@@ -333,16 +323,14 @@ if __name__ == "__main__":
     filepath = 'test_data/dna_seq_rebuild_val.json'
     pasta_file = 'error/p.fasta'
     output = 'test_data/dna_seq_rebuild_val_output.json'
-    # avg_dist, avg_max_inner_dist, max_inner_dist = test_max_eps(pasta_file, 5, None, copy_num)
-    # print(avg_dist, avg_max_inner_dist)
+
     # n_cluster, dna_seqs = get_sequences('test_data/dna_seq_rebuild_train.json', cut=-1)
     n_cluster, dna_seqs = get_sequences_from_fasta(pasta_file, copy_num=copy_num)
-    test_kmeans(dna_seqs, n_cluster, 'mle')
-    # cluster_pipeline(dna_seqs, n_cluster, copy_num=copy_num, pca_component=None)
-    # end = time.time()
-    # print('运行时间:', end - start)
-    # with open(output, 'w') as fp:
-    #     json.dump({
-    #         'Time': end - start,
-    #         'data': cluster_result
-    #     }, fp)
+    cluster_result = cluster_pipeline(dna_seqs, n_cluster, copy_num=copy_num, pca_component=None)
+    end = time.time()
+    print('运行时间:', end - start)
+    with open(output, 'w') as fp:
+        json.dump({
+            'Time': end - start,
+            'data': cluster_result
+        }, fp)
