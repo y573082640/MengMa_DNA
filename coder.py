@@ -3,15 +3,15 @@ __author__ = "Zhang, Haoling [zhanghaoling@genomics.cn]"
 import copy
 import queue
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime
 from itertools import product
 from random import choice
 from statistics import mode
-
+import multiprocessing
 import cv2
 import numpy as np
-from Chamaeleo.methods.ecc import ReedSolomon,Hamming
+from Chamaeleo.methods.ecc import ReedSolomon, Hamming
 from Chamaeleo.methods.flowed import YinYangCode, DNAFountain
 from Chamaeleo.methods.inherent import base_index
 from Chamaeleo.utils import data_handle, indexer
@@ -455,82 +455,69 @@ class MyYinYangCode(YinYangCode):
         return bit_segments, dna_bits_map
 
 
-
 ######################################## 从错误中恢复的代码
 ## author:xyc
+
 def recover_seq(mutated_seqs, cur_rec_seq=''):
     # 假设4个碱基中只会发生一次突变
-    patterns = defaultdict(int)
-    for mutated_seq in mutated_seqs:
-        patterns[mutated_seq[:min(3, len(mutated_seq))]] += 1
-    max_count = max(patterns.values())
-    most_common_pattern = max(patterns, key=patterns.get)
+    three_bases_patterns = Counter([mutated_seq[:min(3, len(mutated_seq))] for mutated_seq in mutated_seqs])
+    candi_common_patterns = three_bases_patterns.most_common()
+
+    most_common_pattern = candi_common_patterns[0][0]
 
     min_len = min(map(len, mutated_seqs))
     if min_len < 4 or len(most_common_pattern) < 3:
         return cur_rec_seq + most_common_pattern
 
-    common_patterns = [p for p in patterns.keys() if patterns[p] == max_count]
+    four_base_patterns = Counter([mutated_seq[:4] for mutated_seq in mutated_seqs])
+    most_common_pattern_4base = four_base_patterns.most_common()[0][0]
     # 多条序列突变结果一致
-    if len(common_patterns) > 1:
-        common_patterns = [mutated_seq[:4] for mutated_seq in mutated_seqs if patterns[mutated_seq[:3]] == max_count]
-        # 多比较一位
-        Four_base_patterns = {cc: common_patterns.count(cc) for cc in common_patterns}
-        most_common_pattern = max(Four_base_patterns, key=Four_base_patterns.get)[:3]
+    if len(candi_common_patterns) > 1 and \
+            candi_common_patterns[0][1] == candi_common_patterns[1][1]:
+        most_common_pattern = most_common_pattern_4base[:3]
 
-    rec_seq = []
     # 三位碱基相同
     if most_common_pattern in ['AAA', 'TTT', 'CCC', 'GGG']:
-        for mutated_seq in mutated_seqs:
-            # 可确认一对相邻碱基未突变
-            if mutated_seq[:3] == most_common_pattern:
-                rec_seq.append(mutated_seq[2:])
-            # 删除 / 末位突变，可在下一次递归中判断
-            elif mutated_seq[1] == most_common_pattern[1]:
-                rec_seq.append(mutated_seq[1:])
-            # 插入
-            elif mutated_seq[2:4] == most_common_pattern[1:3]:
-                rec_seq.append(mutated_seq[2:])
-            else:
-                rec_seq.append(mutated_seq[2:])
+        rec_seq = [mutated_seq[2:] if mutated_seq[:3] == most_common_pattern \
+                       else ''.join((most_common_pattern[0], mutated_seq[3:])) for mutated_seq in mutated_seqs]
+        # mutated_seq[:3] == most_common_pattern -> 可确认一对相邻碱基未突变
+        # 其余情况，均可留到下一次递归再判断
 
-        return recover_seq(rec_seq, cur_rec_seq + most_common_pattern[:2])
+        return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[:2])))
 
     else:
-        for mutated_seq in mutated_seqs:
-            middle_base = most_common_pattern[1]
-            if mutated_seq[:3] == most_common_pattern:
-                rec_seq.append(mutated_seq[1:])
-            else:
-                if mutated_seq[1] == most_common_pattern[1]:
-                    rec_seq.append(mutated_seq[1:])
-                # 中间位删除 -> 插入原来的中间位
-                elif mutated_seq[1] == most_common_pattern[2]:
-                    rec_seq.append(middle_base + mutated_seq[1:])
-                # 中间位突变 -> 替换原来的中间位
-                elif mutated_seq[2] == most_common_pattern[2]:
-                    rec_seq.append(middle_base + mutated_seq[2:])
-                # 插入 -> 跳过插入位
-                elif mutated_seq[2: 4] == most_common_pattern[1:]:
-                    rec_seq.append(mutated_seq[2:])
-                else:
-                    rec_seq.append(mutated_seq[1:])
-        return recover_seq(rec_seq, cur_rec_seq + most_common_pattern[0])
+        rec_seq = [mutated_seq[1:] if mutated_seq[:3] == most_common_pattern \
+                       else mutated_seq[1:]
+        if mutated_seq[1] == most_common_pattern[1] \
+            else mutated_seq[2:]
+        if mutated_seq[2:5] == most_common_pattern_4base[1:] \
+            else ''.join((most_common_pattern[1], mutated_seq[1:]))
+        if mutated_seq[1:3] == most_common_pattern_4base[2:4] \
+            else ''.join((most_common_pattern[1], mutated_seq[2:]))
+        if mutated_seq[2:4] == most_common_pattern_4base[2:4] \
+            else mutated_seq[1:]
+                   for mutated_seq in mutated_seqs]
+        # mutated_seq[:3] == most_common_pattern -> 未突变
+        # mutated_seq[2:5] == most_common_pattern_4base[1:] -> 插入，跳过插入位
+        # mutated_seq[1:3] == most_common_pattern_4base[2:4] -> 中间位删除，插入原来的中间位
+        # mutated_seq[2:4] == most_common_pattern_4base[2:4] -> 中间位突变，替换原来的中间位
+
+        return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[0])))
 
 
 def bislide_recover(mutated_seqs, seq_len):
     # 在序列首尾加padding，确保第一位是对的
-    forward = ['P' + mutated_seq[: seq_len // 2 + 10] for mutated_seq in mutated_seqs]
-    inverse = ['P' + mutated_seq[-1: -(seq_len // 2 + 10):-1] for mutated_seq in mutated_seqs]
+    forward = ['P' + mutated_seq[: seq_len // 2 + 5] for mutated_seq in mutated_seqs]
+    inverse = ['P' + mutated_seq[-1: -(seq_len // 2 + 5):-1] for mutated_seq in mutated_seqs]
     forward_rec = recover_seq(forward)[1:][:seq_len // 2]
-    inverse_rec = recover_seq(inverse)[1:][:seq_len // 2 + seq_len % 2][::-1]
+    inverse_rec = recover_seq(inverse)[1:][:seq_len - len(forward_rec)][::-1]
 
     # 正反两条恢复链长度小于原序列，中间插入随机碱基（保证首尾正确性）
     if len(forward_rec) + len(inverse_rec) < seq_len:
         rec_seq = forward_rec + ''.join(
-            [choice(["A", "C", "G", "T"]) for _ in range(seq_len - len(forward_rec) - len(inverse_rec))]) + inverse_rec
+            [choice('ATGC') for _ in range(seq_len - len(forward_rec) - len(inverse_rec))]) + inverse_rec
     else:
-        rec_seq = forward_rec + inverse_rec
+        rec_seq = ''.join((forward_rec, inverse_rec))
     return rec_seq
 
 
@@ -545,7 +532,8 @@ def cal_acc(ori_seq, rec_seq):
 
 ######################################## 聚类算法相关
 
-def get_subseq_features(dna_seq, sub_len):
+def get_subseq_features(dna_seq):
+    sub_len = 7
     seq_len = len(dna_seq)
     subseq_len = seq_len // sub_len
     features = []
@@ -556,7 +544,7 @@ def get_subseq_features(dna_seq, sub_len):
     return features
 
 
-def get_kmer_features(dna_seq, kmer_len=2):
+def get_kmer_features(dna_seq):
     kmer_counts = dict()
     for kmer in kmers_3:
         kmer_counts[kmer] = dna_seq.count(kmer)
@@ -566,8 +554,9 @@ def get_kmer_features(dna_seq, kmer_len=2):
 
 # 拼接特征
 def get_features(seqs, n_components, sub_len, kmer_len):
-    subseq_features = np.array([get_subseq_features(seq, sub_len) for seq in seqs])
-    kmer_features = np.array([get_kmer_features(seq, kmer_len) for seq in seqs])
+    pool = multiprocessing.Pool(4)
+    subseq_features = np.array(pool.map(get_subseq_features, seqs))
+    kmer_features = np.array(pool.map(get_kmer_features, seqs))
     seq_fearures = np.concatenate((kmer_features, subseq_features), axis=1)
     seq_fearures = (seq_fearures - seq_fearures.mean(axis=0)) / seq_fearures.std(axis=0)
     # PCA
@@ -595,8 +584,29 @@ def k_distance(features, k):
     avg = np.average(a_sorted)
     mid = np.median(a_sorted)
     ## 输出
-    print(mid, percentile_995, percentile_001, avg)
     return mid, percentile_995, percentile_001, avg
+
+
+# def k_distance(features, k):
+#     neigh = NearestNeighbors(n_neighbors=k)
+#     sample_num = 30000
+#     mids, percentile_995s, percentile_001s, avgs = [], [], [], []
+#     for iter in range(5):
+#         samples = np.random.choice(range(features.shape[0]), sample_num)
+#         samples = features[samples]
+#         neigh.fit(samples)
+#         distances, indices = neigh.kneighbors(samples)
+#         max_dist = np.squeeze(distances[:, -1])
+#         ## 90中位数
+#         a_sorted = np.sort(max_dist)
+#         percentile_995 = int(0.995 * len(a_sorted))
+#         percentile_001 = int(0.001 * len(a_sorted))
+#         percentile_995s.append(a_sorted[percentile_995])
+#         percentile_001s.append(a_sorted[percentile_001])
+#         avgs.append(np.average(a_sorted))
+#         mids.append(np.median(a_sorted))
+#     ## 输出
+#     return np.average(mids), np.average(percentile_995s), np.average(percentile_001s), np.average(avgs)
 
 
 def divide_index_into_clusters(labels, index_of_seqs):
@@ -638,8 +648,9 @@ def cluster_pipeline(dna_seqs, n_cluster, copy_num, pca_component=None, rough_th
     print('get dna seqs features ... ')
     seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
     mid, percentile_995, percentile_001, avg = k_distance(seq_features, copy_num)
-    eps, min_eps = max(np.ceil(percentile_995), percentile_995 + 0.4), np.floor(
-        percentile_001)  ## cluster_pipeline只适用于喷泉码结果，阴阳码结果聚类密度差距过大，该方法不适用
+    # eps, min_eps = max(np.ceil(percentile_995), percentile_995 + 0.5), np.floor(
+    #     percentile_001)  ## cluster_pipeline只适用于喷泉码结果，阴阳码结果聚类密度差距过大，该方法不适用
+    eps, min_eps = 7.0, 5.0
     pipeline = queue.Queue()
     pipeline.put((n_cluster, range(len(dna_seqs))))
     results = []
@@ -743,9 +754,10 @@ def cluster(seq_features, indices, copy_num, avg_dist, rough_threshold):
 ######################################## 读入图像的操作
 ## author:ydh
 class ImgReader:
-    def __init__(self,encode_format):
+    def __init__(self, encode_format, encode_param):
         self.sample_rate = None
         self.encode_format = encode_format
+        self.encode_param = encode_param
 
     def readImg(self, filepath: str, down_sample: bool) -> array:
         image = cv2.imread(filepath)
@@ -756,15 +768,16 @@ class ImgReader:
                     new_width = image.shape[1] // ratio_width
                     break
             for ratio_height in [4, 3, 2, 1]:
-                if image.shape[0] % ratio_width == 0:
+                if image.shape[0] % ratio_height == 0:
                     new_height = image.shape[0] // ratio_height
                     break
             downscaledimage = cv2.resize(image, (new_width, new_height))
             self.sample_rate = (ratio_width, ratio_height)
         else:
+            self.sample_rate = None
             downscaledimage = image
         # Encode image to PNG format in memory buffer
-        encoded_img = cv2.imencode(self.encode_format, downscaledimage)[1]
+        encoded_img = cv2.imencode(self.encode_format, downscaledimage, self.encode_param)[1]
         # Convert to NumPy array
         encoded_img_np = np.array(encoded_img)
         return encoded_img_np
@@ -777,10 +790,11 @@ class ImgReader:
         if blur:
             decoded_img = cv2.medianBlur(decoded_img, 3)
         # 还原
-        print(self.sample_rate)
+        # print(self.sample_rate)
         if self.sample_rate is not None:
             decoded_img = cv2.resize(decoded_img, (cols * self.sample_rate[0], rows * self.sample_rate[1]))
         return decoded_img
+
 
 ######################################## 需要我们自己实现的Coder
 
@@ -806,14 +820,14 @@ class Coder(DefaultCoder):
 
         """
         super().__init__(team_id=team_id)
-        self.address, self.payload = 20, 160
+        self.address, self.payload = 20, 200
         self.check_size = 4
         self.supplement, self.message_number = 0, 0
-        self.copy_num, self.n_cluster = 9, None
-        self.seq_len = Hamming()
-        self.coding_scheme = DNAFountain(redundancy=2)
+        self.copy_num, self.n_cluster = 13, None
+        self.seq_len = None
+        self.coding_scheme = DNAFountain(redundancy=1.5, need_pre_check=True, gc_bias=0.4)
         self.error_correction = Hamming()
-        self.reader = ImgReader(encode_format='.jpg')
+        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY, 75])
 
     def image_to_dna(self, input_image_path, need_logs=True):
         """
@@ -839,7 +853,7 @@ class Coder(DefaultCoder):
                               need_logs=True)
         if need_logs:
             print("read img ...")
-        img_array = self.reader.readImg(input_image_path, False)
+        img_array = self.reader.readImg(input_image_path, True)
         if need_logs:
             print("transcode bits ...")
         results = pipeline.transcode(direction="t_c",
@@ -847,10 +861,15 @@ class Coder(DefaultCoder):
                                      output_path='target.dna',
                                      segment_length=self.payload,
                                      index_length=self.address, index=True)
-        dna_sequences = ["".join(_) for _ in results['dna']]
-        self.n_cluster = len(dna_sequences)
-        self.seq_len = len(dna_sequences[0])
-        return dna_sequences * self.copy_num
+
+        dna_sequences = []
+        for ss in results['dna']:
+            # dna_sequences += ["".join(ss)] * self.copy_num
+            dna_sequences.append("".join(ss))
+        dna_sequences = dna_sequences * self.copy_num
+        self.n_cluster = len(results['dna'])
+        self.seq_len = len(results['dna'][0])
+        return dna_sequences
 
     def dna_to_image(self, dna_sequences, output_image_path, need_logs=True):
         """
@@ -876,13 +895,16 @@ class Coder(DefaultCoder):
         pipeline = MyPipeline(coding_scheme=self.coding_scheme,
                               error_correction=self.error_correction,
                               need_logs=True)
-        result = pipeline.transcode(direction="t_s",
-                                    segment_length=self.payload,
-                                    index_length=self.address,
-                                    input_string=rebuild_dna_sequences,
-                                    index=True)
-        img_np = np.array(result['bit'])
-        img_np = np.packbits(img_np)
-        img = self.reader.toImg(img_np, blur=False)
-        print(img.shape)
-        cv2.imwrite(output_image_path, img)
+        try:
+            result = pipeline.transcode(direction="t_s",
+                                        segment_length=self.payload,
+                                        index_length=self.address,
+                                        input_string=rebuild_dna_sequences,
+                                        index=True)
+            img_np = np.array(result['bit'])
+            img_np = np.packbits(img_np)
+            img = self.reader.toImg(img_np, blur=False)
+            cv2.imwrite(output_image_path, img)
+        except Exception as e:
+            print(e)
+            pass
