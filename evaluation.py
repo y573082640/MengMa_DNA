@@ -302,7 +302,7 @@ class EvaluationPipeline:
 
         if need_logs:
             print("Shuffle the obtained DNA sequences.")
-        shuffle(target_dna_sequences)
+        # shuffle(target_dna_sequences)
 
         if random_seed is not None:
             seed(None)
