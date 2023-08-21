@@ -1,21 +1,20 @@
 __author__ = "Zhang, Haoling [zhanghaoling@genomics.cn]"
 
+import math
+import os
 import copy
 import queue
 import time
 from collections import defaultdict, Counter
 from datetime import datetime
 from itertools import product
-from random import choice
-from statistics import mode
-import multiprocessing
+from random import choice, sample, shuffle
 import cv2
 import numpy as np
-from Chamaeleo.methods.ecc import ReedSolomon, Hamming
+from Chamaeleo.methods.ecc import Hamming
 from Chamaeleo.methods.flowed import YinYangCode, DNAFountain
 from Chamaeleo.methods.inherent import base_index
 from Chamaeleo.utils import data_handle, indexer
-from Chamaeleo.utils.data_handle import save_model, load_model
 from Chamaeleo.utils.indexer import divide
 from Chamaeleo.utils.monitor import Monitor
 from Chamaeleo.utils.pipelines import TranscodePipeline
@@ -26,6 +25,12 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 
 from evaluation import DefaultCoder
+
+# print("Number of CPUs:", os.cpu_count())
+# pid = 0
+# affinity = os.sched_getaffinity(pid)
+# print("Process is eligible to run on:", affinity)
+# os.sched_setaffinity(0, set(sample(range(128), 16)))
 
 kmers_2 = [''.join(p) for p in product('ACGT', repeat=2)]
 kmers_3 = ["".join(p) for p in product("ACGT", repeat=3)]
@@ -176,6 +181,13 @@ class MyPipeline(TranscodePipeline):
                 else:
                     raise ValueError("There is no digital data input here!")
 
+                # 需要在bit_segments前插入一段用于表示长度bit_size的段落
+                bit_size_binary_list = list(map(int, bin(bit_size)[2:]))
+                bit_size_binary_list = [0] * (segment_length - len(bit_size_binary_list)) + bit_size_binary_list
+                bit_segments.insert(0, bit_size_binary_list)
+                # print('input', bit_size)
+                ###
+
                 original_bit_segments = copy.deepcopy(bit_segments)
 
                 if "index" in info and info["index"]:
@@ -197,7 +209,7 @@ class MyPipeline(TranscodePipeline):
 
                 results = self.coding_scheme.silicon_to_carbon(bit_segments, bit_size)
                 dna_sequences = results['dna']
-
+                # print(len(bit_segments), len(dna_sequences))
                 # dna_sequences = []
                 # ## 冗余复制次数
                 # print('dna seq nums:', len(dna_sequences))
@@ -275,7 +287,6 @@ class MyPipeline(TranscodePipeline):
                 self.records["decoding runtime"] = round(results["t"], 3)
 
                 bit_segments = results["bit"]
-                bit_size = results["s"]
 
                 if not bit_segments:
                     self.records["error rate"] = "100.00%"
@@ -309,6 +320,14 @@ class MyPipeline(TranscodePipeline):
                         indices, bit_segments = indexer.divide_all(bit_segments, None, self.need_logs)
 
                     bit_segments = indexer.sort_order(indices, bit_segments, self.need_logs)
+
+                # 第一段表示文件长度！
+                bit_size_binary_list = bit_segments[0]
+                bit_size_binary_list = [str(i) for i in bit_size_binary_list]
+                bit_size = int("".join(bit_size_binary_list), 2)
+                # print("output", bit_size)
+                bit_segments = bit_segments[1:]
+                ###
 
                 if "output_path" in info:
                     data_handle.write_bits_to_file(info["output_path"], bit_segments, bit_size, self.need_logs)
@@ -554,9 +573,11 @@ def get_kmer_features(dna_seq):
 
 # 拼接特征
 def get_features(seqs, n_components, sub_len, kmer_len):
-    pool = multiprocessing.Pool(4)
-    subseq_features = np.array(pool.map(get_subseq_features, seqs))
-    kmer_features = np.array(pool.map(get_kmer_features, seqs))
+    # pool = multiprocessing.Pool(4)
+    # subseq_features = np.array(pool.map(get_subseq_features, seqs))
+    # kmer_features = np.array(pool.map(get_kmer_features, seqs))
+    subseq_features = np.array([get_subseq_features(ss) for ss in seqs])
+    kmer_features = np.array([get_kmer_features(ss) for ss in seqs])
     seq_fearures = np.concatenate((kmer_features, subseq_features), axis=1)
     seq_fearures = (seq_fearures - seq_fearures.mean(axis=0)) / seq_fearures.std(axis=0)
     # PCA
@@ -647,7 +668,7 @@ def level3_pass(seq_features, index_of_seqs, n_cluster):
 def cluster_pipeline(dna_seqs, n_cluster, copy_num, pca_component=None, rough_threshold=3000):
     print('get dna seqs features ... ')
     seq_features = get_features(dna_seqs, pca_component, kmer_len=3, sub_len=7)
-    mid, percentile_995, percentile_001, avg = k_distance(seq_features, copy_num)
+    # mid, percentile_995, percentile_001, avg = k_distance(seq_features, copy_num)
     # eps, min_eps = max(np.ceil(percentile_995), percentile_995 + 0.5), np.floor(
     #     percentile_001)  ## cluster_pipeline只适用于喷泉码结果，阴阳码结果聚类密度差距过大，该方法不适用
     eps, min_eps = 7.0, 5.0
@@ -763,28 +784,32 @@ class ImgReader:
         image = cv2.imread(filepath)
         if down_sample:
             # 调整图像尺寸
-            for ratio_width in [4, 3, 2, 1]:
+            for ratio_width in [3, 2, 1]:
                 if image.shape[1] % ratio_width == 0:
                     new_width = image.shape[1] // ratio_width
                     break
-            for ratio_height in [4, 3, 2, 1]:
+            for ratio_height in [3, 2, 1]:
                 if image.shape[0] % ratio_height == 0:
                     new_height = image.shape[0] // ratio_height
                     break
             downscaledimage = cv2.resize(image, (new_width, new_height))
-            self.sample_rate = (ratio_width, ratio_height)
+            self.sample_rate = [ratio_width, ratio_height]
         else:
-            self.sample_rate = None
+            self.sample_rate = [1, 1]
             downscaledimage = image
         # Encode image to PNG format in memory buffer
         encoded_img = cv2.imencode(self.encode_format, downscaledimage, self.encode_param)[1]
         # Convert to NumPy array
+        # 将sample_rate为UTF-8字节数组
+        sample_rate_bytes = list(self.sample_rate)
+        encoded_img = sample_rate_bytes + list(encoded_img)
         encoded_img_np = np.array(encoded_img)
         return encoded_img_np
 
     def toImg(self, img_array: array, blur: bool):
         # 解码
-        decoded_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+        self.sample_rate = img_array[:2]
+        decoded_img = cv2.imdecode(img_array[2:], cv2.IMREAD_UNCHANGED)
         rows, cols, _channels = map(int, decoded_img.shape)
         # 去噪
         if blur:
@@ -814,20 +839,24 @@ class Coder(DefaultCoder):
             (1) Please do not add parameters other than "team_id".
                 All parameters should be declared directly in this interface instead of being passed in as parameters.
                 If a parameter depends on the input image, please assign its value in the "image_to_dna" interface.
-            (2) Please do not divide "coder.py" into multiple script files.
-                Only the script called "coder.py" will be automatically copied by
+            (2) Please do not divide "team1011.py" into multiple script files.
+                Only the script called "team1011.py" will be automatically copied by
                 the competition process to the competition script folder.
 
         """
         super().__init__(team_id=team_id)
-        self.address, self.payload = 20, 200
+        self.address, self.payload = 20, 208
         self.check_size = 4
+        self.redundancy = 1
+        self.gc_bias = 0.01
         self.supplement, self.message_number = 0, 0
-        self.copy_num, self.n_cluster = 13, None
+        self.copy_num, self.n_cluster = 15, None
         self.seq_len = None
-        self.coding_scheme = DNAFountain(redundancy=1.5, need_pre_check=True, gc_bias=0.4)
-        self.error_correction = Hamming()
-        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY, 75])
+        self.error_correction = None
+        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY, 77])
+        self.final_length = self.address + self.payload
+        if self.error_correction is not None:
+            self.final_length += 8
 
     def image_to_dna(self, input_image_path, need_logs=True):
         """
@@ -848,9 +877,13 @@ class Coder(DefaultCoder):
         """
         if need_logs:
             print("init models ...")
-        pipeline = MyPipeline(coding_scheme=self.coding_scheme,
+        coding_scheme = DNAFountain(redundancy=self.redundancy,
+                                    need_pre_check=False,
+                                    gc_bias=self.gc_bias
+                                    )
+        pipeline = MyPipeline(coding_scheme=coding_scheme,
                               error_correction=self.error_correction,
-                              need_logs=True)
+                              need_logs=False)
         if need_logs:
             print("read img ...")
         img_array = self.reader.readImg(input_image_path, True)
@@ -858,7 +891,7 @@ class Coder(DefaultCoder):
             print("transcode bits ...")
         results = pipeline.transcode(direction="t_c",
                                      input_numpy=img_array,
-                                     output_path='target.dna',
+                                     # output_path='target.dna',
                                      segment_length=self.payload,
                                      index_length=self.address, index=True)
 
@@ -867,6 +900,7 @@ class Coder(DefaultCoder):
             # dna_sequences += ["".join(ss)] * self.copy_num
             dna_sequences.append("".join(ss))
         dna_sequences = dna_sequences * self.copy_num
+        shuffle(dna_sequences)
         self.n_cluster = len(results['dna'])
         self.seq_len = len(results['dna'][0])
         return dna_sequences
@@ -890,11 +924,20 @@ class Coder(DefaultCoder):
         """
         if need_logs:
             print("Decode DNA sequences based on the mapping scheme.")
-        grouped_dna_sequences = cluster_pipeline(dna_sequences, self.n_cluster, self.copy_num, None)
+        n_cluster = len(dna_sequences) // self.copy_num
+        grouped_dna_sequences = cluster_pipeline(dna_sequences, n_cluster, self.copy_num, None)
         rebuild_dna_sequences = [bislide_recover(g, self.seq_len) for g in grouped_dna_sequences]
-        pipeline = MyPipeline(coding_scheme=self.coding_scheme,
+        coding_scheme = DNAFountain(redundancy=self.redundancy,
+                                    need_pre_check=False,
+                                    gc_bias=self.gc_bias,
+                                    decode_packets=math.ceil(len(rebuild_dna_sequences) / (1 + self.redundancy))
+                                    # 1 + redundancy
+                                    )
+        coding_scheme.bit_size = 1  # 无关紧要
+        coding_scheme.segment_length = self.final_length  # 汉明码多8位
+        pipeline = MyPipeline(coding_scheme=coding_scheme,
                               error_correction=self.error_correction,
-                              need_logs=True)
+                              need_logs=False)
         try:
             result = pipeline.transcode(direction="t_s",
                                         segment_length=self.payload,
@@ -906,5 +949,8 @@ class Coder(DefaultCoder):
             img = self.reader.toImg(img_np, blur=False)
             cv2.imwrite(output_image_path, img)
         except Exception as e:
-            print(e)
+            print('cant not recover image because of :',e)
+            f = open(output_image_path,'w', encoding='utf-8')
+            f.write(str(list(img_np)))
+            f.close()
             pass

@@ -25,8 +25,8 @@ class DefaultCoder:
             (1) Please do not add parameters other than "team_id".
                 All parameters should be declared directly in this interface instead of being passed in as parameters.
                 If a parameter depends on the input image, please assign its value in the "image_to_dna" interface.
-            (2) Please do not divide "coder.py" into multiple script files.
-                Only the script called "coder.py" will be automatically copied by
+            (2) Please do not divide "team1011.py" into multiple script files.
+                Only the script called "team1011.py" will be automatically copied by
                 the competition process to the competition script folder.
 
         """
