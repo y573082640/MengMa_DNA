@@ -22,3 +22,4 @@ if __name__ == "__main__":
         pipeline(input_image_path=file_name, output_image_path="error/obtained.bmp",
                  source_dna_path="error/o.fasta", target_dna_path="error/p.fasta", random_seed=966518)
 
+# 966518

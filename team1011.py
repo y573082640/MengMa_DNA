@@ -26,11 +26,11 @@ from sklearn.neighbors import NearestNeighbors
 
 from evaluation import DefaultCoder
 
-# print("Number of CPUs:", os.cpu_count())
-# pid = 0
-# affinity = os.sched_getaffinity(pid)
-# print("Process is eligible to run on:", affinity)
-# os.sched_setaffinity(0, set(sample(range(128), 16)))
+print("Number of CPUs:", os.cpu_count())
+pid = 0
+affinity = os.sched_getaffinity(pid)
+print("Process is eligible to run on:", affinity)
+os.sched_setaffinity(0, set(sample(range(128), 16)))
 
 kmers_2 = [''.join(p) for p in product('ACGT', repeat=2)]
 kmers_3 = ["".join(p) for p in product("ACGT", repeat=3)]
@@ -853,7 +853,7 @@ class Coder(DefaultCoder):
         self.copy_num, self.n_cluster = 15, None
         self.seq_len = None
         self.error_correction = None
-        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY, 77])
+        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY,79])
         self.final_length = self.address + self.payload
         if self.error_correction is not None:
             self.final_length += 8
