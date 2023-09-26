@@ -1,5 +1,4 @@
 __author__ = "Zhang, Haoling [zhanghaoling@genomics.cn]"
-
 import math
 import os
 import copy
@@ -26,11 +25,11 @@ from sklearn.neighbors import NearestNeighbors
 
 from evaluation import DefaultCoder
 
-print("Number of CPUs:", os.cpu_count())
-pid = 0
-affinity = os.sched_getaffinity(pid)
-print("Process is eligible to run on:", affinity)
-os.sched_setaffinity(0, set(sample(range(128), 16)))
+# print("Number of CPUs:", os.cpu_count())
+# pid = 0
+# affinity = os.sched_getaffinity(pid)
+# print("Process is eligible to run on:", affinity)
+# os.sched_setaffinity(0, set(sample(range(128), 16)))
 
 kmers_2 = [''.join(p) for p in product('ACGT', repeat=2)]
 kmers_3 = ["".join(p) for p in product("ACGT", repeat=3)]
@@ -775,10 +774,11 @@ def cluster(seq_features, indices, copy_num, avg_dist, rough_threshold):
 ######################################## 读入图像的操作
 ## author:ydh
 class ImgReader:
-    def __init__(self, encode_format, encode_param):
+    def __init__(self, encode_format, encode_param, pipeline:MyPipeline):
         self.sample_rate = None
         self.encode_format = encode_format
         self.encode_param = encode_param
+        self.pipeline = pipeline
 
     def readImg(self, filepath: str, down_sample: bool) -> array:
         image = cv2.imread(filepath)
@@ -797,8 +797,9 @@ class ImgReader:
         else:
             self.sample_rate = [1, 1]
             downscaledimage = image
+        print("下采样后大小:", downscaledimage.size * downscaledimage.itemsize, "字节")
         # Encode image to PNG format in memory buffer
-        encoded_img = cv2.imencode(self.encode_format, downscaledimage, self.encode_param)[1]
+        encoded_img = cv2.imencode(self.encode_format, downscaledimage, self.encode_param)[1]      
         # Convert to NumPy array
         # 将sample_rate为UTF-8字节数组
         sample_rate_bytes = list(self.sample_rate)
@@ -848,12 +849,12 @@ class Coder(DefaultCoder):
         self.address, self.payload = 20, 208
         self.check_size = 4
         self.redundancy = 1
-        self.gc_bias = 0.01
+        self.gc_bias = 0.1
         self.supplement, self.message_number = 0, 0
         self.copy_num, self.n_cluster = 15, None
         self.seq_len = None
         self.error_correction = None
-        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY,79])
+        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY,95])
         self.final_length = self.address + self.payload
         if self.error_correction is not None:
             self.final_length += 8
@@ -900,6 +901,8 @@ class Coder(DefaultCoder):
             # dna_sequences += ["".join(ss)] * self.copy_num
             dna_sequences.append("".join(ss))
         dna_sequences = dna_sequences * self.copy_num
+        print("DNA序列数量:", len(dna_sequences))
+        # raise ValueError('early exit')
         shuffle(dna_sequences)
         self.n_cluster = len(results['dna'])
         self.seq_len = len(results['dna'][0])
