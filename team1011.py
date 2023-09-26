@@ -774,7 +774,7 @@ def cluster(seq_features, indices, copy_num, avg_dist, rough_threshold):
 ######################################## 读入图像的操作
 ## author:ydh
 class ImgReader:
-    def __init__(self, encode_format, encode_param, pipeline:MyPipeline):
+    def __init__(self, encode_format, encode_param, pipeline:MyPipeline=None):
         self.sample_rate = None
         self.encode_format = encode_format
         self.encode_param = encode_param
@@ -783,21 +783,29 @@ class ImgReader:
     def readImg(self, filepath: str, down_sample: bool) -> array:
         image = cv2.imread(filepath)
         if down_sample:
-            # 调整图像尺寸
-            for ratio_width in [3, 2, 1]:
-                if image.shape[1] % ratio_width == 0:
-                    new_width = image.shape[1] // ratio_width
-                    break
-            for ratio_height in [3, 2, 1]:
-                if image.shape[0] % ratio_height == 0:
-                    new_height = image.shape[0] // ratio_height
-                    break
+            # 调整图像尺寸，如果图本身很小则不调整
+            if image.shape[1] <= 2000:
+                ratio_width = 1
+                new_width = image.shape[1]
+            else:
+                for ratio_width in [3, 2, 1]:
+                    if image.shape[1] % ratio_width == 0:
+                        new_width = image.shape[1] // ratio_width
+                        break
+            if image.shape[0] <= 1000:
+                ratio_height = 1
+                new_height = image.shape[0]       
+            else:     
+                for ratio_height in [3, 2, 1]:
+                    if image.shape[0] % ratio_height == 0:
+                        new_height = image.shape[0] // ratio_height
+                        break
             downscaledimage = cv2.resize(image, (new_width, new_height))
             self.sample_rate = [ratio_width, ratio_height]
         else:
             self.sample_rate = [1, 1]
             downscaledimage = image
-        print("下采样后大小:", downscaledimage.size * downscaledimage.itemsize, "字节")
+       
         # Encode image to PNG format in memory buffer
         encoded_img = cv2.imencode(self.encode_format, downscaledimage, self.encode_param)[1]      
         # Convert to NumPy array
@@ -854,10 +862,35 @@ class Coder(DefaultCoder):
         self.copy_num, self.n_cluster = 15, None
         self.seq_len = None
         self.error_correction = None
-        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY,95])
         self.final_length = self.address + self.payload
         if self.error_correction is not None:
             self.final_length += 8
+
+    def get_best_quality(self,input_image_path):
+        coding_scheme = DNAFountain(
+                                    redundancy=self.redundancy,
+                                    need_pre_check=False,
+                                    gc_bias=0.5
+                                    )
+        pipeline = MyPipeline(coding_scheme=coding_scheme,
+                              error_correction=self.error_correction,
+                              need_logs=False)
+        
+        quality = 80
+        while True:
+            print("尝试最优编码策略,当前图片质量:",quality)
+            reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY,quality])
+            img_array = reader.readImg(input_image_path, True)
+            results = pipeline.transcode(direction="t_c",
+                                        input_numpy=img_array,
+                                        segment_length=self.payload,
+                                        index_length=self.address, 
+                                        index=True)
+            seq_number = len(results['dna']) * self.copy_num
+            if quality >= 97 or seq_number >= 280000:
+                break
+            quality += 3
+        return quality        
 
     def image_to_dna(self, input_image_path, need_logs=True):
         """
@@ -876,32 +909,33 @@ class Coder(DefaultCoder):
             Each DNA sequence is suggested to carry its address information in the sequence list.
             Because the DNA sequence list obtained in DNA sequencing is inconsistent with the existing list.
         """
+
+        quality = self.get_best_quality(input_image_path)
         if need_logs:
             print("init models ...")
-        coding_scheme = DNAFountain(redundancy=self.redundancy,
+        coding_scheme = DNAFountain(
+                                    redundancy=self.redundancy,
                                     need_pre_check=False,
                                     gc_bias=self.gc_bias
                                     )
         pipeline = MyPipeline(coding_scheme=coding_scheme,
                               error_correction=self.error_correction,
                               need_logs=False)
-        if need_logs:
-            print("read img ...")
+        self.reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY,quality])
         img_array = self.reader.readImg(input_image_path, True)
         if need_logs:
-            print("transcode bits ...")
+            print("transcoding img to dna ...")
         results = pipeline.transcode(direction="t_c",
-                                     input_numpy=img_array,
-                                     # output_path='target.dna',
-                                     segment_length=self.payload,
-                                     index_length=self.address, index=True)
-
+                                    input_numpy=img_array,
+                                    segment_length=self.payload,
+                                    index_length=self.address, 
+                                    index=True)
         dna_sequences = []
         for ss in results['dna']:
-            # dna_sequences += ["".join(ss)] * self.copy_num
             dna_sequences.append("".join(ss))
         dna_sequences = dna_sequences * self.copy_num
-        print("DNA序列数量:", len(dna_sequences))
+        if need_logs:
+            print("DNA number is:", len(dna_sequences))
         # raise ValueError('early exit')
         shuffle(dna_sequences)
         self.n_cluster = len(results['dna'])

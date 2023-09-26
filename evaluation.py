@@ -240,6 +240,16 @@ class EvaluationPipeline:
 
         print("Total score: %.3f" % ((0.2 * scores[0] + 0.3 * scores[1] + 0.5 * scores[2]) * 100))
 
+        with open('log.txt', 'w') as f:
+            f.write("\\nFor the figure (" + input_image_path + "), the score of your coder are as follow:")
+            f.write("\\nDensity score (20% of the total): " + ("%.3f" % (scores[0] * 100)))  
+            f.write("\\nCompatibility score (30% of the total): " + ("%.3f" % (scores[1] * 100)))
+            if scores[2] > 0:
+                f.write("\\nRecovery score (50% of the total): " + ("%.3f" % (scores[2] * 100)))
+            else: 
+                f.write("\\nRecovery score (50% of the total): 0.000 (the obtained data unable to parse as image).")
+            f.write("\\nTotal score: %.3f" % ((0.2 * scores[0] + 0.3 * scores[1] + 0.5 * scores[2]) * 100))
+
     def simulate_wet_pipeline(self, source_dna_sequences: list, random_seed: int = None, need_logs: bool = True):
         """
         Simulate the wet experimental process.
