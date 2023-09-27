@@ -29,7 +29,7 @@ from evaluation import DefaultCoder
 # pid = 0
 # affinity = os.sched_getaffinity(pid)
 # print("Process is eligible to run on:", affinity)
-# os.sched_setaffinity(0, set(sample(range(128), 16)))
+# os.sched_setaffinity(0, set(sample(range(128), 24)))
 
 kmers_2 = [''.join(p) for p in product('ACGT', repeat=2)]
 kmers_3 = ["".join(p) for p in product("ACGT", repeat=3)]
@@ -476,7 +476,49 @@ class MyYinYangCode(YinYangCode):
 ######################################## 从错误中恢复的代码
 ## author:xyc
 
-def recover_seq(mutated_seqs, cur_rec_seq=''):
+# def recover_seq(mutated_seqs, cur_rec_seq=''):
+#     # 假设4个碱基中只会发生一次突变
+#     three_bases_patterns = Counter([mutated_seq[:min(3, len(mutated_seq))] for mutated_seq in mutated_seqs])
+#     candi_common_patterns = three_bases_patterns.most_common()
+
+#     most_common_pattern = candi_common_patterns[0][0]
+
+#     min_len = min(map(len, mutated_seqs))
+#     if min_len < 4 or len(most_common_pattern) < 3:
+#         return cur_rec_seq + most_common_pattern
+
+#     four_base_patterns = Counter([mutated_seq[:4] for mutated_seq in mutated_seqs])
+#     most_common_pattern_4base = four_base_patterns.most_common()[0][0]
+#     # 多条序列突变结果一致
+#     if len(candi_common_patterns) > 1 and \
+#             candi_common_patterns[0][1] == candi_common_patterns[1][1]:
+#         most_common_pattern = most_common_pattern_4base[:3]
+
+#     # 三位碱基相同
+#     if most_common_pattern in ['AAA', 'TTT', 'CCC', 'GGG']:
+#         rec_seq = [mutated_seq[2:] if mutated_seq[:3] == most_common_pattern \
+#                        else ''.join((most_common_pattern[0], mutated_seq[3:])) for mutated_seq in mutated_seqs]
+#         # mutated_seq[:3] == most_common_pattern -> 可确认一对相邻碱基未突变
+#         # 其余情况，均可留到下一次递归再判断
+
+#         return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[:2])))
+
+#     else:
+#         rec_seq = [mutated_seq[1:] if mutated_seq[:3] == most_common_pattern \
+#                        else mutated_seq[1:]
+#         if mutated_seq[1] == most_common_pattern[1] \
+#             else mutated_seq[2:]
+#         if mutated_seq[2:5] == most_common_pattern_4base[1:] \
+#             else ''.join((most_common_pattern[1], mutated_seq[1:]))
+#         if mutated_seq[1:3] == most_common_pattern_4base[2:4] \
+#             else ''.join((most_common_pattern[1], mutated_seq[2:]))
+#         if mutated_seq[2:4] == most_common_pattern_4base[2:4] \
+#             else mutated_seq[1:]
+#                    for mutated_seq in mutated_seqs]
+#         return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[0])))
+    
+def recover_seq(mutated_seqs, cur_rec_seq='', doubt_valid_steps=3, doubt_idx=[]):
+    
     # 假设4个碱基中只会发生一次突变
     three_bases_patterns = Counter([mutated_seq[:min(3, len(mutated_seq))] for mutated_seq in mutated_seqs])
     candi_common_patterns = three_bases_patterns.most_common()
@@ -486,54 +528,86 @@ def recover_seq(mutated_seqs, cur_rec_seq=''):
     min_len = min(map(len, mutated_seqs))
     if min_len < 4 or len(most_common_pattern) < 3:
         return cur_rec_seq + most_common_pattern
-
+    
     four_base_patterns = Counter([mutated_seq[:4] for mutated_seq in mutated_seqs])
     most_common_pattern_4base = four_base_patterns.most_common()[0][0]
     # 多条序列突变结果一致
     if len(candi_common_patterns) > 1 and \
-            candi_common_patterns[0][1] == candi_common_patterns[1][1]:
+        candi_common_patterns[0][1] == candi_common_patterns[1][1]:
         most_common_pattern = most_common_pattern_4base[:3]
 
+    if len(doubt_idx) > 0:
+        max_doubt_step = max(x[1] for x in doubt_idx)
+        if max_doubt_step < doubt_valid_steps:
+            for i in range(len(doubt_idx)):
+                doubt_idx[i][1] += 1
+        else:
+            remained_doubt_list = []
+            for i in range(len(doubt_idx)):
+                if doubt_idx[i][1] == max_doubt_step:
+                    if mutated_seqs[doubt_idx[i][0]][3:6] == most_common_pattern_4base[1:]:
+                        mutated_seqs[doubt_idx[i][0]] = ''.join((most_common_pattern_4base[0], mutated_seqs[doubt_idx[i][0]][3:]))
+                else:
+                    remained_doubt_list.append(doubt_idx[i])
+            doubt_idx = remained_doubt_list
     # 三位碱基相同
     if most_common_pattern in ['AAA', 'TTT', 'CCC', 'GGG']:
         rec_seq = [mutated_seq[2:] if mutated_seq[:3] == most_common_pattern \
-                       else ''.join((most_common_pattern[0], mutated_seq[3:])) for mutated_seq in mutated_seqs]
+                    else ''.join((most_common_pattern[0], mutated_seq[3:])) for mutated_seq in mutated_seqs]
         # mutated_seq[:3] == most_common_pattern -> 可确认一对相邻碱基未突变
         # 其余情况，均可留到下一次递归再判断
 
-        return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[:2])))
+        return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[:2])),
+                           doubt_valid_steps=doubt_valid_steps, doubt_idx=doubt_idx)
 
     else:
-        rec_seq = [mutated_seq[1:] if mutated_seq[:3] == most_common_pattern \
-                       else mutated_seq[1:]
-        if mutated_seq[1] == most_common_pattern[1] \
-            else mutated_seq[2:]
-        if mutated_seq[2:5] == most_common_pattern_4base[1:] \
-            else ''.join((most_common_pattern[1], mutated_seq[1:]))
-        if mutated_seq[1:3] == most_common_pattern_4base[2:4] \
-            else ''.join((most_common_pattern[1], mutated_seq[2:]))
-        if mutated_seq[2:4] == most_common_pattern_4base[2:4] \
-            else mutated_seq[1:]
-                   for mutated_seq in mutated_seqs]
-        # mutated_seq[:3] == most_common_pattern -> 未突变
-        # mutated_seq[2:5] == most_common_pattern_4base[1:] -> 插入，跳过插入位
-        # mutated_seq[1:3] == most_common_pattern_4base[2:4] -> 中间位删除，插入原来的中间位
-        # mutated_seq[2:4] == most_common_pattern_4base[2:4] -> 中间位突变，替换原来的中间位
+        rec_seq = []
+        for i, mutated_seq in enumerate(mutated_seqs):
+            if mutated_seq[:3] == most_common_pattern or \
+                mutated_seq[1] == most_common_pattern[1]:
+                rec_seq.append(mutated_seq[1:])
+            elif mutated_seq[2:5] == most_common_pattern_4base[1:] and \
+                mutated_seq[1:3] == most_common_pattern_4base[2:4]:
+                rec_seq.append(''.join((most_common_pattern[1], mutated_seq[1:])))
+                doubt_idx.append([i, 0])
+            elif mutated_seq[1:3] == most_common_pattern_4base[2:4]:
+                rec_seq.append(''.join((most_common_pattern[1], mutated_seq[1:])))
+            elif mutated_seq[2:5] == most_common_pattern_4base[1:]:
+                rec_seq.append(mutated_seq[2:])
+            
+            elif mutated_seq[2:4] == most_common_pattern_4base[2:4]:
+                rec_seq.append(''.join((most_common_pattern[1], mutated_seq[2:])))
+            else:
+                rec_seq.append(''.join((most_common_pattern[1], mutated_seq[2:])))
 
-        return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[0])))
+        return recover_seq(rec_seq, ''.join((cur_rec_seq, most_common_pattern[0])), 
+                           doubt_valid_steps=doubt_valid_steps, doubt_idx=doubt_idx)
 
+# def bislide_recover(mutated_seqs, seq_len):
+#     # 在序列首尾加padding，确保第一位是对的
+#     forward = ['P' + mutated_seq[: seq_len // 2 + 5] for mutated_seq in mutated_seqs]
+#     inverse = ['P' + mutated_seq[-1: -(seq_len // 2 + 5):-1] for mutated_seq in mutated_seqs]
+#     forward_rec = recover_seq(forward)[1:][:seq_len // 2]
+#     inverse_rec = recover_seq(inverse)[1:][:seq_len - len(forward_rec)][::-1]
+
+#     # 正反两条恢复链长度小于原序列，中间插入随机碱基（保证首尾正确性）
+#     if len(forward_rec) + len(inverse_rec) < seq_len:
+#         rec_seq = forward_rec + ''.join(
+#             [choice('ATGC') for _ in range(seq_len - len(forward_rec) - len(inverse_rec))]) + inverse_rec
+#     else:
+#         rec_seq = ''.join((forward_rec, inverse_rec))
+#     return rec_seq
 
 def bislide_recover(mutated_seqs, seq_len):
     # 在序列首尾加padding，确保第一位是对的
-    forward = ['P' + mutated_seq[: seq_len // 2 + 5] for mutated_seq in mutated_seqs]
-    inverse = ['P' + mutated_seq[-1: -(seq_len // 2 + 5):-1] for mutated_seq in mutated_seqs]
+    forward = ['P' + mutated_seq[: seq_len // 2 + 10] for mutated_seq in mutated_seqs]
+    inverse = ['P' + mutated_seq[-1: -(seq_len // 2 + 10):-1] for mutated_seq in mutated_seqs]
     forward_rec = recover_seq(forward)[1:][:seq_len // 2]
-    inverse_rec = recover_seq(inverse)[1:][:seq_len - len(forward_rec)][::-1]
+    inverse_rec = recover_seq(inverse)[1:][:seq_len // 2 + seq_len % 2][::-1]
 
     # 正反两条恢复链长度小于原序列，中间插入随机碱基（保证首尾正确性）
     if len(forward_rec) + len(inverse_rec) < seq_len:
-        rec_seq = forward_rec + ''.join(
-            [choice('ATGC') for _ in range(seq_len - len(forward_rec) - len(inverse_rec))]) + inverse_rec
+        rec_seq = forward_rec + ''.join([choice('ATGC') for _ in range(seq_len - len(forward_rec) - len(inverse_rec))]) + inverse_rec
     else:
         rec_seq = ''.join((forward_rec, inverse_rec))
     return rec_seq
@@ -857,7 +931,7 @@ class Coder(DefaultCoder):
         self.address, self.payload = 20, 208
         self.check_size = 4
         self.redundancy = 1
-        self.gc_bias = 0.1
+        self.gc_bias = 0.01
         self.supplement, self.message_number = 0, 0
         self.copy_num, self.n_cluster = 15, None
         self.seq_len = None
@@ -876,7 +950,7 @@ class Coder(DefaultCoder):
                               error_correction=self.error_correction,
                               need_logs=False)
         
-        quality = 80
+        quality = 100
         while True:
             print("尝试最优编码策略,当前图片质量:",quality)
             reader = ImgReader(encode_format='.webp', encode_param=[cv2.IMWRITE_WEBP_QUALITY,quality])
@@ -887,7 +961,7 @@ class Coder(DefaultCoder):
                                         index_length=self.address, 
                                         index=True)
             seq_number = len(results['dna']) * self.copy_num
-            if quality >= 97 or seq_number >= 280000:
+            if quality >= 95 or seq_number >= 280000:
                 break
             quality += 3
         return quality        

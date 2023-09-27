@@ -240,7 +240,7 @@ class EvaluationPipeline:
 
         print("Total score: %.3f" % ((0.2 * scores[0] + 0.3 * scores[1] + 0.5 * scores[2]) * 100))
 
-        with open('log.txt', 'w') as f:
+        with open('log.txt', 'a+') as f:
             f.write("\\nFor the figure (" + input_image_path + "), the score of your coder are as follow:")
             f.write("\\nDensity score (20% of the total): " + ("%.3f" % (scores[0] * 100)))  
             f.write("\\nCompatibility score (30% of the total): " + ("%.3f" % (scores[1] * 100)))
